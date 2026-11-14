@@ -13,6 +13,10 @@ import type { LinkService } from '../links/service.js';
  * - `DELETE /api/v1/links/:alias`: takedown idempotente. Deshabilita la fila
  *   (no la borra) e invalida la caché del redirect.
  * - `POST /api/v1/admin/blocklist`: alta/actualización manual de un dominio.
+ *   Al activar un dominio también deshabilita los enlaces que ya existían
+ *   hacia él: bloquear solo las altas nuevas dejaría el abuso ya publicado
+ *   redirigiendo. Desactivar una entrada NO reactiva nada (el takedown es
+ *   irreversible, igual que el de un alias suelto).
  */
 
 const blocklistSchema = z
@@ -73,11 +77,15 @@ export function createAdminRouter({
     }
 
     const added = await blocklist.addManual(domain, parsed.data.enabled);
+    const disabledLinks = added.enabled
+      ? await service.disableByDomain(added.domain)
+      : 0;
 
     res.status(201).json({
       domain: added.domain,
       source: 'manual',
       enabled: added.enabled,
+      disabledLinks,
     });
   });
 

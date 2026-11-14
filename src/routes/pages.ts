@@ -16,6 +16,7 @@ import { renderHomePage, type CreatedLinkView } from '../ui/pages.js';
 import {
   buildShortUrl,
   enforceCreateRateLimits,
+  enforceLookupRateLimits,
   getClientIpHash,
   setRetryAfter,
 } from './shared.js';
@@ -29,6 +30,7 @@ export type PagesRouterOptions = {
   formTokenSecret: string;
   createIpRules: readonly RateLimitRule[];
   createGlobalRules: readonly RateLimitRule[];
+  lookupIpRules: readonly RateLimitRule[];
   now: () => Date;
   /** En tests se pone 0 para no esperar; en producción vale 3 s. */
   formTokenMinAgeMs?: number | undefined;
@@ -89,6 +91,7 @@ export function createPagesRouter({
   formTokenSecret,
   createIpRules,
   createGlobalRules,
+  lookupIpRules,
   now,
   formTokenMinAgeMs = DEFAULT_FORM_MIN_AGE_MS,
 }: PagesRouterOptions): Router {
@@ -112,6 +115,31 @@ export function createPagesRouter({
     let created: CreatedLinkView | null = null;
 
     if (requestedAlias && CUSTOM_ALIAS_PATTERN.test(requestedAlias)) {
+      // Solo la consulta con alias toca la DB; la portada sola no se limita.
+      const limited = enforceLookupRateLimits(
+        rateLimiter,
+        getClientIpHash(req, ipHashSecret),
+        lookupIpRules,
+        now().getTime(),
+      );
+
+      if (limited) {
+        setRetryAfter(res, limited);
+        res
+          .status(429)
+          .set('Cache-Control', 'no-store')
+          .type('html')
+          .send(
+            renderHomePage({
+              errorMessage:
+                'Demasiadas consultas desde tu conexión. Espera un momento y vuelve a intentarlo.',
+              abuseContactEmail,
+              ...formMeta(),
+            }),
+          );
+        return;
+      }
+
       const result = await service.getMetadata(requestedAlias);
 
       if (result.ok) {

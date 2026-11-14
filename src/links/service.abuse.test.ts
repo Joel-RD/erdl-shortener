@@ -320,3 +320,82 @@ describe('dedupe y cuota por IP', () => {
     expect(afterExpiry.ok).toBe(true);
   });
 });
+
+describe('dedupe y caducidad', () => {
+  const ipHash = 'a'.repeat(64);
+
+  it('una petición permanente y otra con caducidad no se deduplican entre sí', async () => {
+    const current = { value: new Date('2026-01-01T00:00:00.000Z') };
+    const { service } = await setup({ current });
+    const url = 'https://example.com/dedupe-vida';
+    const expiresAt = new Date(current.value.getTime() + 60 * 60_000);
+
+    const permanent = await service.create({ url, createdIpHash: ipHash });
+    const timed = await service.create({
+      url,
+      expiresAt,
+      createdIpHash: ipHash,
+    });
+    const reversePermanent = await service.create({
+      url,
+      createdIpHash: ipHash,
+    });
+
+    expect(permanent.ok && timed.ok && reversePermanent.ok).toBe(true);
+    if (!permanent.ok || !timed.ok || !reversePermanent.ok) return;
+
+    expect(timed.link.alias).not.toBe(permanent.link.alias);
+    expect(timed.link.expiresAt).toBe(expiresAt.toISOString());
+    // La petición permanente repetida sí reutiliza la permanente.
+    expect(reversePermanent.link.alias).toBe(permanent.link.alias);
+  });
+
+  it('la misma URL con exactamente la misma caducidad sigue deduplicando', async () => {
+    const current = { value: new Date('2026-01-01T00:00:00.000Z') };
+    const { service } = await setup({ current });
+    const url = 'https://example.com/dedupe-misma-vida';
+    const expiresAt = new Date(current.value.getTime() + 60 * 60_000);
+
+    const first = await service.create({
+      url,
+      expiresAt,
+      createdIpHash: ipHash,
+    });
+    const second = await service.create({
+      url,
+      expiresAt: new Date(expiresAt),
+      createdIpHash: ipHash,
+    });
+
+    expect(first.ok && second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+
+    expect(second.link.alias).toBe(first.link.alias);
+  });
+});
+
+describe('disableByDomain', () => {
+  it('deshabilita solo enlaces activos del dominio y vacía la caché', async () => {
+    const { service } = await setup({ withCache: true });
+
+    const a = await service.create({
+      url: 'https://malo.example.org/a',
+      alias: 'malo-a',
+    });
+    await service.create({ url: 'https://malo.example.org/b', alias: 'malo-b' });
+    await service.create({ url: 'https://bueno.example.net/c', alias: 'bueno-c' });
+
+    expect(a.ok).toBe(true);
+    expect((await service.resolve('malo-a')).ok).toBe(true);
+    expect((await service.resolve('bueno-c')).ok).toBe(true);
+
+    expect(await service.disableByDomain('Example.ORG')).toBe(2);
+    expect(await service.disableByDomain('example.org')).toBe(0);
+
+    expect(await service.resolve('malo-a')).toEqual({
+      ok: false,
+      reason: 'gone',
+    });
+    expect((await service.resolve('bueno-c')).ok).toBe(true);
+  });
+});

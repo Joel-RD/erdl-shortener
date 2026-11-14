@@ -56,6 +56,16 @@ export const DEFAULT_CREATE_GLOBAL_RULES: readonly RateLimitRule[] = [
   { name: 'global-hour', limit: 500, windowMs: 3_600_000 },
 ];
 
+/**
+ * Lecturas públicas de metadata (`GET /api/v1/links/:alias` y `GET /?created=`).
+ * Cada una cuesta una consulta a la DB y expone destino y clics, así que se
+ * limitan aparte de los redirects: 60/min por IP basta para uso humano y
+ * frena la enumeración de aliases.
+ */
+export const DEFAULT_LOOKUP_IP_RULES: readonly RateLimitRule[] = [
+  { name: 'minute', limit: 60, windowMs: 60_000 },
+];
+
 /** La ruta más caliente: 300 redirects/min por IP. */
 export const DEFAULT_REDIRECT_IP_RULES: readonly RateLimitRule[] = [
   { name: 'minute', limit: 300, windowMs: 60_000 },

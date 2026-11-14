@@ -54,6 +54,15 @@ export function enforceRedirectRateLimits(
   return consumeRules(limiter, `redirect:ip:${ipHash}`, rules, nowMs);
 }
 
+export function enforceLookupRateLimits(
+  limiter: RateLimiter,
+  ipHash: string,
+  rules: readonly RateLimitRule[],
+  nowMs: number,
+): RateLimitRejection | null {
+  return consumeRules(limiter, `lookup:ip:${ipHash}`, rules, nowMs);
+}
+
 export function setRetryAfter(
   res: { set(field: string, value: string): unknown },
   rejection: RateLimitRejection,

@@ -100,6 +100,12 @@ export type LinkService = {
   getMetadata(alias: string): Promise<LookupResult>;
   /** Takedown: marca la fila y invalida la caché sin borrar el alias. */
   disable(alias: string, reason?: string): Promise<DisableResult>;
+  /**
+   * Takedown masivo: deshabilita todos los enlaces activos de un dominio
+   * registrable (el que se guarda en `links.domain`). Devuelve cuántos
+   * enlaces cambió. Es idempotente: repetirlo devuelve 0.
+   */
+  disableByDomain(domain: string, reason?: string): Promise<number>;
   /** Invalida la caché de un alias (lo usa el takedown de la Fase 7). */
   invalidate(alias: string): void;
 };
@@ -194,6 +200,7 @@ export function createLinkService({
   async function findRecentDuplicate(
     urlHash: string,
     createdIpHash: string,
+    expiresAt: string | null,
     current: Date,
   ): Promise<LinkRecord | null> {
     const since = new Date(
@@ -208,9 +215,14 @@ export function createLinkService({
                AND created_at >= ?
                AND disabled_at IS NULL
                AND (expires_at IS NULL OR expires_at > ?)
+               AND expires_at IS ?
              ORDER BY created_at DESC
              LIMIT 1`,
-      args: [urlHash, createdIpHash, since, current.toISOString()],
+      // `IS ?` compara igual que `=` pero también casa NULL con NULL: un
+      // enlace permanente solo es duplicado de otra petición permanente, y
+      // uno con caducidad solo de otra con exactamente la misma caducidad.
+      // Así nunca se devuelve un enlace con una vida distinta a la pedida.
+      args: [urlHash, createdIpHash, since, current.toISOString(), expiresAt],
     });
 
     const row = result.rows[0];
@@ -330,6 +342,7 @@ export function createLinkService({
           const duplicate = await findRecentDuplicate(
             urlHash,
             createdIpHash,
+            expiration.value,
             current,
           );
 
@@ -455,6 +468,22 @@ export function createLinkService({
       const existing = await findByAlias(alias);
 
       return existing ? { ok: true } : { ok: false, reason: 'not_found' };
+    },
+
+    async disableByDomain(domain, reason = 'domain_blocked') {
+      const result = await db.execute({
+        sql: `UPDATE links
+                 SET disabled_at = ?, disabled_reason = ?
+               WHERE domain = ?
+                 AND disabled_at IS NULL`,
+        args: [now().toISOString(), reason, domain.toLowerCase()],
+      });
+
+      // La caché no indexa por dominio y su TTL es de 60 s: vaciarla es la
+      // forma barata de que ningún enlace retirado siga redirigiendo.
+      if (result.rowsAffected > 0) cache?.clear();
+
+      return result.rowsAffected;
     },
 
     invalidate(alias) {

@@ -137,21 +137,32 @@ cookies). Todas las rutas admin responden `401` sin `Authorization: Bearer`.
      -d '{"domain":"dominio-malicioso.example"}'
    ```
 
+   La respuesta incluye `disabledLinks`: cuántos enlaces **ya existentes** de
+   ese dominio se deshabilitaron en el mismo paso (motivo `domain_blocked`;
+   la caché de redirects se vacía, así que dejan de redirigir de inmediato).
+   Repetir el alta es idempotente y devuelve `0`.
+
    Para desactivar una entrada sin borrarla: enviar `{"enabled":false}`.
-   El alta manual invalida la caché de blocklist (TTL normal: 60 s).
+   Desactivarla permite crear enlaces nuevos otra vez, pero **no reactiva**
+   los que ya se retiraron (el takedown es irreversible). El alta manual
+   invalida la caché de blocklist (TTL normal: 60 s).
 
 4. Documentar la decisión (fecha, alias, dominio, motivo) en el canal interno.
 
 La blocklist parte de `seed/blocklist.json` (acortadores y redirectores
-conocidos) y añade el propio dominio de `BASE_URL` para evitar bucles. Solo
-impide **crear** enlaces nuevos: los enlaces ya existentes se retiran con
-`DELETE /api/v1/links/:alias`.
+conocidos) y añade el propio dominio de `BASE_URL` para evitar bucles. Las
+entradas **de la semilla** solo impiden crear enlaces nuevos; las altas
+manuales además retiran los existentes (ver arriba). Un enlace suelto se
+retira con `DELETE /api/v1/links/:alias`.
 
 ## Retención y privacidad
 
 - La IP se guarda como `HMAC-SHA256(IP_HASH_SECRET, IPv4 o prefijo /64 IPv6)`.
 - `jobs/retention.ts` corre al arrancar y cada 6 h: pone `created_ip_hash = NULL`
   en filas con `created_at` anterior a `IP_RETENTION_DAYS`.
+- Los logs HTTP **no** incluyen la IP del cliente (`remoteAddress` y
+  `remotePort` se eliminan del serializer de `pino-http`): la única huella de
+  red persistente es el HMAC con retención limitada.
 - **Consecuencia consciente:** esas filas dejan de contar para la cuota y el
   dedupe de esa IP. Es una decisión de privacidad, no un bug.
 
@@ -159,8 +170,12 @@ impide **crear** enlaces nuevos: los enlaces ya existentes se retiran con
 
 - Crear: 5/min, 30/h y 100/día por IP + 500/h global.
 - Redirects: 300/min por IP.
+- Lecturas públicas (`GET /api/v1/links/:alias` y `GET /?created=`): 60/min por
+  IP, con `429` + `Retry-After`. La portada sin `created` no se limita.
 - Cuota: 50 enlaces activos por IP.
-- Dedupe: misma URL normalizada + misma IP en 24 h devuelve el alias existente.
+- Dedupe: misma URL normalizada + misma IP + misma caducidad (o ambas sin
+  caducidad) en 24 h devuelve el alias existente. Si se pide una caducidad
+  distinta se crea un enlace nuevo, para no devolver uno con otra vida útil.
 - Formulario: token HMAC (`timestamp.firma`) con antigüedad mínima de 3 s,
   máximo 2 h, campo trampa `website` y rechazo genérico.
 - Blocklist: dominio registrable con `tldts`; bloquea subdominios, no sufijos

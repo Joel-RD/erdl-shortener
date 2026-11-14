@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url';
 import express, { type ErrorRequestHandler } from 'express';
 import helmet from 'helmet';
 import type { Logger } from 'pino';
+import { stdSerializers } from 'pino';
 import { pinoHttp } from 'pino-http';
 import { createBlocklist, type Blocklist } from './abuse/blocklist.js';
 import { createClickBuffer, type ClickBuffer } from './abuse/click-buffer.js';
@@ -9,6 +10,7 @@ import {
   createMemoryRateLimiter,
   DEFAULT_CREATE_GLOBAL_RULES,
   DEFAULT_CREATE_IP_RULES,
+  DEFAULT_LOOKUP_IP_RULES,
   DEFAULT_REDIRECT_IP_RULES,
   type RateLimiter,
   type RateLimitRule,
@@ -29,6 +31,7 @@ export type AppRateLimits = {
   createIp?: readonly RateLimitRule[] | undefined;
   createGlobal?: readonly RateLimitRule[] | undefined;
   redirectIp?: readonly RateLimitRule[] | undefined;
+  lookupIp?: readonly RateLimitRule[] | undefined;
 };
 
 export type AppOptions = {
@@ -96,6 +99,8 @@ export function createApp(options: AppOptions = {}): express.Express {
     options.limits?.createGlobal ?? DEFAULT_CREATE_GLOBAL_RULES;
   const redirectIpRules =
     options.limits?.redirectIp ?? DEFAULT_REDIRECT_IP_RULES;
+  const lookupIpRules =
+    options.limits?.lookupIp ?? DEFAULT_LOOKUP_IP_RULES;
 
   const service = createLinkService({
     db,
@@ -150,6 +155,17 @@ export function createApp(options: AppOptions = {}): express.Express {
   app.use(
     pinoHttp({
       logger: httpLogger,
+      serializers: {
+        // La IP solo se guarda como HMAC con retención limitada. El
+        // serializer por defecto añadiría `remoteAddress` y `remotePort` en
+        // claro a cada línea de log, fuera de esa retención.
+        req: stdSerializers.wrapRequestSerializer((serialized) => {
+          const { remoteAddress: _address, remotePort: _port, ...rest } =
+            serialized;
+
+          return rest as typeof serialized;
+        }),
+      },
       autoLogging: {
         ignore: (req) => req.url?.split('?')[0] === '/health',
       },
@@ -188,6 +204,7 @@ export function createApp(options: AppOptions = {}): express.Express {
       ipHashSecret,
       createIpRules,
       createGlobalRules,
+      lookupIpRules,
       now,
     }),
   );
@@ -204,6 +221,7 @@ export function createApp(options: AppOptions = {}): express.Express {
         : {}),
       createIpRules,
       createGlobalRules,
+      lookupIpRules,
       now,
     }),
   );

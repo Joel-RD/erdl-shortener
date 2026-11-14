@@ -1,3 +1,4 @@
+import { Writable } from 'node:stream';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Express } from 'express';
@@ -10,6 +11,7 @@ import {
 } from './abuse/form-token.js';
 import { createApp, getAppRuntime, type AppRuntime } from './app.js';
 import { config } from './config.js';
+import { createLogger } from './logger.js';
 import {
   createTempDatabase,
   type TempDatabase,
@@ -637,6 +639,7 @@ describe('abuso II: blocklist, honeypot y administración', () => {
       domain: 'bloqueo-admin.test',
       source: 'manual',
       enabled: true,
+      disabledLinks: 0,
     });
 
     const blocked = await request(app)
@@ -719,5 +722,184 @@ describe('abuso II: blocklist, honeypot y administración', () => {
       await strictRuntime.close();
       await strictDatabase.cleanup();
     }
+  });
+});
+
+describe('regresiones de la revisión de código', () => {
+  const admin = { Authorization: `Bearer ${config.adminToken}` };
+
+  it('los logs HTTP no contienen la IP del cliente en claro', async () => {
+    const database = await createTempDatabase();
+    let output = '';
+    const sink = new Writable({
+      write(chunk, _encoding, callback) {
+        output += String(chunk);
+        callback();
+      },
+    });
+    const logged = createApp({
+      db: database.client,
+      logger: createLogger({ level: 'info', destination: sink }),
+      limits: { createIp: UNLIMITED, createGlobal: [], redirectIp: [] },
+    });
+
+    try {
+      await request(logged)
+        .post('/api/v1/links')
+        .send({ url: 'https://example.com/sin-ip-en-logs' });
+
+      expect(output).toContain('"method":"POST"');
+      expect(output).not.toContain('remoteAddress');
+      expect(output).not.toContain('remotePort');
+      expect(output).not.toContain('127.0.0.1"');
+      expect(output).not.toContain('::ffff:127.0.0.1');
+    } finally {
+      await getAppRuntime(logged).close();
+      await database.cleanup();
+    }
+  });
+
+  it('bloquear un dominio deshabilita los enlaces ya creados hacia él', async () => {
+    const existing = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://phishing.retirar-existentes.test/login' });
+    const sibling = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://sub.retirar-existentes.test/otro' });
+    const unrelated = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://noretirar-existentes.test/ok' });
+
+    // Calienta la caché: sin invalidación seguiría redirigiendo hasta el TTL.
+    const warm = await request(app).get(`/${existing.body.alias}`);
+    expect(warm.status).toBe(302);
+
+    const blocked = await request(app)
+      .post('/api/v1/admin/blocklist')
+      .set(admin)
+      .send({ domain: 'retirar-existentes.test' });
+
+    expect(blocked.status).toBe(201);
+    expect(blocked.body.disabledLinks).toBe(2);
+
+    expect((await request(app).get(`/${existing.body.alias}`)).status).toBe(
+      410,
+    );
+    expect((await request(app).get(`/${sibling.body.alias}`)).status).toBe(
+      410,
+    );
+    expect(
+      (await request(app).get(`/api/v1/links/${existing.body.alias}`)).status,
+    ).toBe(410);
+    // Un dominio parecido pero distinto no se toca.
+    expect((await request(app).get(`/${unrelated.body.alias}`)).status).toBe(
+      302,
+    );
+
+    const reason = await db.execute({
+      sql: 'SELECT disabled_reason FROM links WHERE alias = ?',
+      args: [existing.body.alias],
+    });
+    expect(reason.rows[0]?.disabled_reason).toBe('domain_blocked');
+
+    // Idempotente: repetir el alta no vuelve a tocar nada.
+    const again = await request(app)
+      .post('/api/v1/admin/blocklist')
+      .set(admin)
+      .send({ domain: 'retirar-existentes.test' });
+    expect(again.body.disabledLinks).toBe(0);
+  });
+
+  it('desactivar una entrada de la blocklist no reactiva enlaces retirados', async () => {
+    const created = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://sin-reactivar.test/x' });
+
+    await request(app)
+      .post('/api/v1/admin/blocklist')
+      .set(admin)
+      .send({ domain: 'sin-reactivar.test' });
+
+    const off = await request(app)
+      .post('/api/v1/admin/blocklist')
+      .set(admin)
+      .send({ domain: 'sin-reactivar.test', enabled: false });
+
+    expect(off.body.disabledLinks).toBe(0);
+    expect((await request(app).get(`/${created.body.alias}`)).status).toBe(
+      410,
+    );
+  });
+
+  describe('límite de lecturas públicas', () => {
+    let lookupApp: Express;
+    let lookupDatabase: TempDatabase;
+
+    beforeAll(async () => {
+      lookupDatabase = await createTempDatabase();
+      lookupApp = createApp({
+        db: lookupDatabase.client,
+        formTokenSecret: FORM_SECRET,
+        limits: {
+          createIp: UNLIMITED,
+          createGlobal: [],
+          redirectIp: [],
+          lookupIp: [{ name: 'test', limit: 3, windowMs: 60_000 }],
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await getAppRuntime(lookupApp).close();
+      await lookupDatabase.cleanup();
+    });
+
+    it('GET /api/v1/links/:alias responde 429 con Retry-After al excederlo', async () => {
+      const statuses: number[] = [];
+      let last: request.Response | undefined;
+
+      for (let index = 0; index < 5; index += 1) {
+        last = await request(lookupApp).get('/api/v1/links/no-existe-api');
+        statuses.push(last.status);
+      }
+
+      expect(statuses).toEqual([404, 404, 404, 429, 429]);
+      expect(last?.body.error).toBe('rate_limited');
+      expect(Number(last?.headers['retry-after'])).toBeGreaterThanOrEqual(1);
+      expect(last?.headers['cache-control']).toBe('no-store');
+    });
+
+    it('GET /?created= comparte el límite y la portada sola no cuenta', async () => {
+      // El bucket de la prueba anterior ya está agotado (misma IP).
+      const limited = await request(lookupApp)
+        .get('/?created=no-existe-home')
+        .set('Accept', 'text/html');
+
+      expect(limited.status).toBe(429);
+      expect(limited.headers['retry-after']).toBeDefined();
+      expect(limited.text).toContain('Demasiadas consultas');
+
+      const home = await request(lookupApp)
+        .get('/')
+        .set('Accept', 'text/html');
+
+      expect(home.status).toBe(200);
+    });
+  });
+
+  it('el dedupe no devuelve un enlace con una caducidad distinta a la pedida', async () => {
+    const url = 'https://example.com/dedupe-expiracion-api';
+    const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+
+    const permanent = await request(app).post('/api/v1/links').send({ url });
+    const timed = await request(app)
+      .post('/api/v1/links')
+      .send({ url, expiresAt });
+
+    expect(permanent.status).toBe(201);
+    expect(timed.status).toBe(201);
+    expect(timed.body.alias).not.toBe(permanent.body.alias);
+    expect(permanent.body.expiresAt).toBeNull();
+    expect(timed.body.expiresAt).toBe(expiresAt);
   });
 });

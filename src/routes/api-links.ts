@@ -11,6 +11,7 @@ import {
 } from '../links/service.js';
 import {
   enforceCreateRateLimits,
+  enforceLookupRateLimits,
   getClientIpHash,
   setRetryAfter,
   toLinkResponse,
@@ -49,6 +50,7 @@ export type ApiLinksRouterOptions = {
   ipHashSecret: string;
   createIpRules: readonly RateLimitRule[];
   createGlobalRules: readonly RateLimitRule[];
+  lookupIpRules: readonly RateLimitRule[];
   now: () => Date;
 };
 
@@ -59,6 +61,7 @@ export function createApiLinksRouter({
   ipHashSecret,
   createIpRules,
   createGlobalRules,
+  lookupIpRules,
   now,
 }: ApiLinksRouterOptions): Router {
   const router = Router();
@@ -132,10 +135,27 @@ export function createApiLinksRouter({
   });
 
   router.get('/links/:alias', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+
+    const limited = enforceLookupRateLimits(
+      rateLimiter,
+      getClientIpHash(req, ipHashSecret),
+      lookupIpRules,
+      now().getTime(),
+    );
+
+    if (limited) {
+      setRetryAfter(res, limited);
+      res.status(429).json({
+        error: 'rate_limited',
+        message: 'Demasiadas consultas. Inténtalo de nuevo más tarde.',
+        retryAfter: limited.retryAfterSeconds,
+      });
+      return;
+    }
+
     const alias = req.params.alias ?? '';
     const result = await service.getMetadata(alias);
-
-    res.set('Cache-Control', 'no-store');
 
     if (!result.ok) {
       res.status(result.reason === 'not_found' ? 404 : 410).json({
