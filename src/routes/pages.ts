@@ -3,8 +3,15 @@ import type {
   RateLimiter,
   RateLimitRule,
 } from '../abuse/rate-limit.js';
+import {
+  createFormToken,
+  DEFAULT_FORM_MIN_AGE_MS,
+  FORM_HONEYPOT_FIELD,
+  FORM_TOKEN_FIELD,
+  verifyFormToken,
+} from '../abuse/form-token.js';
 import { CUSTOM_ALIAS_PATTERN } from '../links/alias.js';
-import type { LinkService } from '../links/service.js';
+import type { CreateLinkInput, LinkService } from '../links/service.js';
 import { renderHomePage, type CreatedLinkView } from '../ui/pages.js';
 import {
   buildShortUrl,
@@ -19,13 +26,58 @@ export type PagesRouterOptions = {
   abuseContactEmail?: string | undefined;
   rateLimiter: RateLimiter;
   ipHashSecret: string;
+  formTokenSecret: string;
   createIpRules: readonly RateLimitRule[];
   createGlobalRules: readonly RateLimitRule[];
   now: () => Date;
+  /** En tests se pone 0 para no esperar; en producción vale 3 s. */
+  formTokenMinAgeMs?: number | undefined;
 };
 
 function firstQueryValue(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+function firstBodyValue(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+/** `YYYY-MM-DDTHH:mm` en UTC, el formato que entiende datetime-local. */
+export function formatDatetimeLocalUtc(date: Date): string {
+  return date.toISOString().slice(0, 16);
+}
+
+/**
+ * Convierte el valor de `<input type="datetime-local">` en una fecha UTC.
+ * El formulario dice «UTC» de forma explícita: sin zona horaria del cliente
+ * no hay manera fiable de interpretar otra cosa.
+ */
+export function parseFormExpiration(
+  raw: string,
+): { ok: true; value: Date | null } | { ok: false } {
+  const value = raw.trim();
+
+  if (value === '') return { ok: true, value: null };
+
+  const match =
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2}))?$/.exec(value);
+
+  if (match === null) return { ok: false };
+
+  const minute = match[1] ?? '';
+  const seconds = match[2] ?? '00';
+  const date = new Date(`${minute}:${seconds}.000Z`);
+
+  // `new Date` normaliza fechas imposibles (31 de febrero → marzo). Comparar
+  // el ida y vuelta detecta esos casos y los rechaza.
+  if (
+    !Number.isFinite(date.getTime()) ||
+    formatDatetimeLocalUtc(date) !== minute
+  ) {
+    return { ok: false };
+  }
+
+  return { ok: true, value: date };
 }
 
 export function createPagesRouter({
@@ -34,11 +86,26 @@ export function createPagesRouter({
   abuseContactEmail,
   rateLimiter,
   ipHashSecret,
+  formTokenSecret,
   createIpRules,
   createGlobalRules,
   now,
+  formTokenMinAgeMs = DEFAULT_FORM_MIN_AGE_MS,
 }: PagesRouterOptions): Router {
   const router = Router();
+
+  function formMeta(): { formToken: string; minExpiration: string } {
+    const current = now();
+
+    return {
+      formToken: createFormToken(formTokenSecret, current),
+      // 6 min y no 5: el mínimo del servicio se evalúa al recibir el POST,
+      // así que el borde exacto de 5 min podría rechazarse por latencia.
+      minExpiration: formatDatetimeLocalUtc(
+        new Date(current.getTime() + 6 * 60 * 1000),
+      ),
+    };
+  }
 
   router.get('/', async (req, res) => {
     const requestedAlias = firstQueryValue(req.query.created);
@@ -62,12 +129,19 @@ export function createPagesRouter({
     res
       .set('Cache-Control', 'no-store')
       .type('html')
-      .send(renderHomePage({ created, abuseContactEmail }));
+      .send(
+        renderHomePage({
+          created,
+          abuseContactEmail,
+          ...formMeta(),
+        }),
+      );
   });
 
   router.post('/links', async (req, res) => {
-    const submittedUrl =
-      typeof req.body?.url === 'string' ? req.body.url : '';
+    const submittedUrl = firstBodyValue(req.body?.url);
+    const submittedAlias = firstBodyValue(req.body?.alias).trim();
+    const submittedExpiresAt = firstBodyValue(req.body?.expiresAt);
     const ipHash = getClientIpHash(req, ipHashSecret);
     const limited = enforceCreateRateLimits(
       rateLimiter,
@@ -88,16 +162,73 @@ export function createPagesRouter({
             errorMessage:
               'Demasiadas creaciones desde tu conexión. Espera un momento y vuelve a intentarlo.',
             submittedUrl,
+            submittedAlias,
+            submittedExpiresAt,
             abuseContactEmail,
+            ...formMeta(),
           }),
         );
       return;
     }
 
-    const result = await service.create({
+    const honeypot = firstBodyValue(req.body?.[FORM_HONEYPOT_FIELD]).trim();
+    const formToken = req.body?.[FORM_TOKEN_FIELD];
+    const tokenStatus = verifyFormToken(formTokenSecret, formToken, {
+      now: now(),
+      minAgeMs: formTokenMinAgeMs,
+    });
+
+    // El campo trampa relleno o un token ausente/manipulado descartan el envío
+    // sin crear nada. El mensaje es genérico para no dar pistas al bot.
+    if (honeypot !== '' || tokenStatus !== 'valid') {
+      res
+        .status(400)
+        .set('Cache-Control', 'no-store')
+        .type('html')
+        .send(
+          renderHomePage({
+            errorMessage:
+              'No se pudo validar el formulario. Recarga la página e inténtalo de nuevo.',
+            submittedUrl,
+            submittedAlias,
+            submittedExpiresAt,
+            abuseContactEmail,
+            ...formMeta(),
+          }),
+        );
+      return;
+    }
+
+    const expiration = parseFormExpiration(submittedExpiresAt);
+
+    if (!expiration.ok) {
+      res
+        .status(422)
+        .set('Cache-Control', 'no-store')
+        .type('html')
+        .send(
+          renderHomePage({
+            errorMessage:
+              'La fecha de caducidad no es válida. Indícala en UTC o déjala vacía.',
+            submittedUrl,
+            submittedAlias,
+            submittedExpiresAt,
+            abuseContactEmail,
+            ...formMeta(),
+          }),
+        );
+      return;
+    }
+
+    const input: CreateLinkInput = {
       url: submittedUrl,
       createdIpHash: ipHash,
-    });
+    };
+
+    if (submittedAlias !== '') input.alias = submittedAlias;
+    if (expiration.value !== null) input.expiresAt = expiration.value;
+
+    const result = await service.create(input);
 
     if (!result.ok) {
       const status =
@@ -115,7 +246,10 @@ export function createPagesRouter({
           renderHomePage({
             errorMessage: result.message,
             submittedUrl,
+            submittedAlias,
+            submittedExpiresAt,
             abuseContactEmail,
+            ...formMeta(),
           }),
         );
       return;

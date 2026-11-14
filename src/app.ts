@@ -1,7 +1,9 @@
 import { fileURLToPath } from 'node:url';
 import express, { type ErrorRequestHandler } from 'express';
 import helmet from 'helmet';
+import type { Logger } from 'pino';
 import { pinoHttp } from 'pino-http';
+import { createBlocklist, type Blocklist } from './abuse/blocklist.js';
 import { createClickBuffer, type ClickBuffer } from './abuse/click-buffer.js';
 import {
   createMemoryRateLimiter,
@@ -15,12 +17,13 @@ import { createAliasCache, type AliasCache } from './cache/alias-cache.js';
 import { config } from './config.js';
 import { db as defaultDb, type DatabaseClient } from './db/client.js';
 import { createLinkService } from './links/service.js';
+import { createAdminRouter } from './routes/api-admin.js';
 import { createApiLinksRouter } from './routes/api-links.js';
 import { createPagesRouter } from './routes/pages.js';
 import { createRedirectRouter } from './routes/redirect.js';
 import { wantsHtml } from './routes/shared.js';
 import { renderErrorPage } from './ui/pages.js';
-import { logger } from './logger.js';
+import { logger as defaultLogger } from './logger.js';
 
 export type AppRateLimits = {
   createIp?: readonly RateLimitRule[] | undefined;
@@ -35,6 +38,11 @@ export type AppOptions = {
   cache?: AliasCache | undefined;
   clickBuffer?: ClickBuffer | undefined;
   rateLimiter?: RateLimiter | undefined;
+  blocklist?: Blocklist | undefined;
+  adminToken?: string | undefined;
+  formTokenSecret?: string | undefined;
+  formTokenMinAgeMs?: number | undefined;
+  logger?: Logger | undefined;
   ipHashSecret?: string | undefined;
   limits?: AppRateLimits | undefined;
   maxActiveLinksPerIp?: number | undefined;
@@ -63,6 +71,10 @@ export function createApp(options: AppOptions = {}): express.Express {
     options.abuseContactEmail ?? config.abuseContactEmail;
   const now = options.now ?? (() => new Date());
   const ipHashSecret = options.ipHashSecret ?? config.ipHashSecret;
+  const adminToken = options.adminToken ?? config.adminToken;
+  const formTokenSecret =
+    options.formTokenSecret ?? config.formTokenSecret ?? adminToken;
+  const httpLogger = options.logger ?? defaultLogger;
 
   const cache = options.cache ?? createAliasCache();
   const clickBuffer =
@@ -70,6 +82,13 @@ export function createApp(options: AppOptions = {}): express.Express {
   const rateLimiter =
     options.rateLimiter ??
     createMemoryRateLimiter({ now: () => now().getTime() });
+  const blocklist =
+    options.blocklist ??
+    createBlocklist({
+      db,
+      ownDomain: new URL(config.baseUrl).hostname,
+      now,
+    });
 
   const createIpRules =
     options.limits?.createIp ?? DEFAULT_CREATE_IP_RULES;
@@ -83,6 +102,7 @@ export function createApp(options: AppOptions = {}): express.Express {
     now,
     cache,
     clickBuffer,
+    blocklist,
     maxActiveLinksPerIp: options.maxActiveLinksPerIp,
     dedupeWindowMs: options.dedupeWindowMs,
   });
@@ -129,7 +149,7 @@ export function createApp(options: AppOptions = {}): express.Express {
 
   app.use(
     pinoHttp({
-      logger,
+      logger: httpLogger,
       autoLogging: {
         ignore: (req) => req.url?.split('?')[0] === '/health',
       },
@@ -153,6 +173,14 @@ export function createApp(options: AppOptions = {}): express.Express {
 
   app.use(
     '/api/v1',
+    createAdminRouter({
+      service,
+      blocklist,
+      adminToken,
+    }),
+  );
+  app.use(
+    '/api/v1',
     createApiLinksRouter({
       service,
       baseUrl: config.baseUrl,
@@ -170,6 +198,10 @@ export function createApp(options: AppOptions = {}): express.Express {
       abuseContactEmail,
       rateLimiter,
       ipHashSecret,
+      formTokenSecret,
+      ...(options.formTokenMinAgeMs !== undefined
+        ? { formTokenMinAgeMs: options.formTokenMinAgeMs }
+        : {}),
       createIpRules,
       createGlobalRules,
       now,

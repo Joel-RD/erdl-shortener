@@ -1,0 +1,36 @@
+# Blueprint de Render para el MVP.
+#
+# Una sola instancia always-on: caché, rate limiter y buffer de clics viven en
+# memoria. El plan free duerme el servicio y rompe esos supuestos.
+services:
+  - type: web
+    name: erdl-shortener
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BASE_URL
+        sync: false
+      - key: TRUST_PROXY
+        value: "1"
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: IP_HASH_SECRET
+        generateValue: true
+      - key: FORM_TOKEN_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_AUTH_TOKEN
+        sync: false
+      - key: IP_RETENTION_DAYS
+        value: "45"
+      - key: LOG_LEVEL
+        value: info
+      - key: ABUSE_CONTACT_EMAIL
+        sync: false

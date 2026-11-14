@@ -17,6 +17,25 @@ describe('parseConfig', () => {
     expect(parsed.logLevel).toBe('info');
     expect(parsed.databaseUrl).toBe('file:local.db');
     expect(parsed.databaseAuthToken).toBeUndefined();
+    expect(parsed.formTokenSecret).toBeUndefined();
+    expect(parsed.retentionDays).toBe(45);
+  });
+
+  it('normaliza FORM_TOKEN_SECRET vacío y valida IP_RETENTION_DAYS', () => {
+    const parsed = parseConfig({
+      ...validEnv,
+      FORM_TOKEN_SECRET: '  ',
+      IP_RETENTION_DAYS: '30',
+    });
+
+    expect(parsed.formTokenSecret).toBeUndefined();
+    expect(parsed.retentionDays).toBe(30);
+    expect(() =>
+      parseConfig({ ...validEnv, IP_RETENTION_DAYS: '0' }),
+    ).toThrow(/IP_RETENTION_DAYS/);
+    expect(() =>
+      parseConfig({ ...validEnv, FORM_TOKEN_SECRET: 'corto' }),
+    ).toThrow(/FORM_TOKEN_SECRET/);
   });
 
   it('normaliza DATABASE_AUTH_TOKEN vacío a undefined', () => {

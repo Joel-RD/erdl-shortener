@@ -3,6 +3,7 @@ import { createApp, getAppRuntime } from './app.js';
 import { config } from './config.js';
 import { configureDatabase, db } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
+import { createRetentionJob } from './jobs/retention.js';
 import { logger } from './logger.js';
 
 async function start(): Promise<void> {
@@ -15,6 +16,11 @@ async function start(): Promise<void> {
   const app = createApp();
   const runtime = getAppRuntime(app);
   const server = createServer(app);
+  const retention = createRetentionJob({
+    db,
+    retentionDays: config.retentionDays,
+    logger,
+  });
 
   server.on('error', (error) => {
     logger.fatal({ err: error }, 'server_error');
@@ -26,6 +32,9 @@ async function start(): Promise<void> {
       { port: config.port, env: config.nodeEnv, baseUrl: config.baseUrl },
       'server_listening',
     );
+
+    // El job no bloquea el arranque: corre la primera pasada y luego cada 6 h.
+    retention.start();
   });
 
   let shuttingDown = false;
@@ -35,6 +44,7 @@ async function start(): Promise<void> {
     shuttingDown = true;
 
     logger.info({ signal }, 'shutdown_started');
+    const retentionStopped = retention.stop();
 
     const forceExit = setTimeout(() => {
       logger.error('shutdown_forced');
@@ -52,6 +62,10 @@ async function start(): Promise<void> {
           logger.error({ err: error }, 'shutdown_failed');
           exitCode = 1;
         }
+
+        // La retención pudo quedar a mitad de una pasada; esperarla evita
+        // cerrar la DB mientras su UPDATE sigue en vuelo.
+        await retentionStopped;
 
         try {
           await runtime.close();

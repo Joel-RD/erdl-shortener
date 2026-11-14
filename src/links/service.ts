@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Client, Row } from '@libsql/client';
 import type { AliasCache } from '../cache/alias-cache.js';
 import type { ClickBuffer } from '../abuse/click-buffer.js';
+import type { Blocklist } from '../abuse/blocklist.js';
 import {
   generateAlias,
   validateCustomAlias,
@@ -73,6 +74,7 @@ export type CreateLinkErrorCode =
   | UrlErrorCode
   | AliasErrorCode
   | 'alias_taken'
+  | 'domain_blocked'
   | 'expiration_invalid'
   | 'quota_exceeded';
 
@@ -88,11 +90,17 @@ export type LookupResult =
   | { ok: true; link: LinkRecord }
   | { ok: false; reason: 'not_found' | 'gone' };
 
+export type DisableResult =
+  | { ok: true }
+  | { ok: false; reason: 'not_found' };
+
 export type LinkService = {
   create(input: CreateLinkInput): Promise<CreateLinkResult>;
   resolve(alias: string): Promise<ResolveResult>;
   getMetadata(alias: string): Promise<LookupResult>;
-  /** Invalida la caché de un alias (lo usará el takedown de la Fase 7). */
+  /** Takedown: marca la fila y invalida la caché sin borrar el alias. */
+  disable(alias: string, reason?: string): Promise<DisableResult>;
+  /** Invalida la caché de un alias (lo usa el takedown de la Fase 7). */
   invalidate(alias: string): void;
 };
 
@@ -101,6 +109,7 @@ export type LinkServiceOptions = {
   now?: (() => Date) | undefined;
   cache?: AliasCache | undefined;
   clickBuffer?: Pick<ClickBuffer, 'record'> | undefined;
+  blocklist?: Pick<Blocklist, 'isBlocked'> | undefined;
   dedupeWindowMs?: number | undefined;
   maxActiveLinksPerIp?: number | undefined;
 };
@@ -168,6 +177,7 @@ export function createLinkService({
   now = () => new Date(),
   cache,
   clickBuffer,
+  blocklist,
   dedupeWindowMs = DEFAULT_DEDUPE_WINDOW_MS,
   maxActiveLinksPerIp = DEFAULT_MAX_ACTIVE_LINKS_PER_IP,
 }: LinkServiceOptions): LinkService {
@@ -265,6 +275,18 @@ export function createLinkService({
           ok: false,
           code: validated.code,
           message: validated.message,
+        };
+      }
+
+      // La blocklist se consulta con el dominio registrable ya normalizado,
+      // así que un subdominio nuevo del mismo dominio también queda cubierto.
+      if (blocklist && (await blocklist.isBlocked(validated.value.domain))) {
+        return {
+          ok: false,
+          code: 'domain_blocked',
+          // Mensaje genérico a propósito: no revelamos qué lista ni qué
+          // entrada concreta bloqueó la URL.
+          message: 'Ese dominio no está permitido en este servicio.',
         };
       }
 
@@ -412,6 +434,27 @@ export function createLinkService({
       if (isGone(link, now())) return { ok: false, reason: 'gone' };
 
       return { ok: true, link };
+    },
+
+    async disable(alias, reason = 'admin_takedown') {
+      const result = await db.execute({
+        sql: `UPDATE links
+                 SET disabled_at = ?, disabled_reason = ?
+               WHERE alias = ?
+                 AND disabled_at IS NULL`,
+        args: [now().toISOString(), reason, alias],
+      });
+
+      // Invalidar siempre es barato y evita que una entrada caliente siga
+      // redirigiendo si el UPDATE no cambió nada (por ejemplo, un takedown
+      // repetido sobre un enlace ya deshabilitado).
+      cache?.delete(alias);
+
+      if (result.rowsAffected > 0) return { ok: true };
+
+      const existing = await findByAlias(alias);
+
+      return existing ? { ok: true } : { ok: false, reason: 'not_found' };
     },
 
     invalidate(alias) {

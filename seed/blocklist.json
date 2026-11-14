@@ -1,0 +1,33 @@
+{
+  "description": "Dominios bloqueados de fábrica. Son acortadores, redirectores o servicios que permiten cadenas de redirección y bucles. El dominio propio se añade en tiempo de ejecución desde BASE_URL.",
+  "domains": [
+    "adf.ly",
+    "bit.do",
+    "bit.ly",
+    "bl.ink",
+    "buff.ly",
+    "cutt.ly",
+    "db.tt",
+    "goo.gl",
+    "is.gd",
+    "lnkd.in",
+    "ow.ly",
+    "qr.ae",
+    "rb.gy",
+    "rebrand.ly",
+    "s.id",
+    "shorte.st",
+    "short.io",
+    "shorturl.at",
+    "snipurl.com",
+    "soo.gd",
+    "surl.li",
+    "t.co",
+    "t2m.io",
+    "tiny.cc",
+    "tinyurl.com",
+    "trib.al",
+    "v.gd",
+    "x.co"
+  ]
+}

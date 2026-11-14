@@ -22,6 +22,12 @@ export type HomePageInput = PageChrome & {
   created?: CreatedLinkView | null;
   errorMessage?: string | null;
   submittedUrl?: string;
+  submittedAlias?: string;
+  submittedExpiresAt?: string;
+  /** Token HMAC del honeypot; el formulario no funciona sin él. */
+  formToken?: string;
+  /** Mínimo del input datetime-local, en UTC (`YYYY-MM-DDTHH:mm`). */
+  minExpiration?: string;
 };
 
 export type ErrorPageInput = PageChrome & {
@@ -171,6 +177,10 @@ export function renderHomePage({
   created = null,
   errorMessage = null,
   submittedUrl = '',
+  submittedAlias = '',
+  submittedExpiresAt = '',
+  formToken = '',
+  minExpiration = '',
   abuseContactEmail,
 }: HomePageInput = {}): string {
   const hasCreated = created !== null;
@@ -207,6 +217,11 @@ export function renderHomePage({
           <h2 id="form-title">${formTitle}</h2>
         </div>
         <form class="shorten-form" method="post" action="/links">
+          <input type="hidden" name="_formToken" value="${escapeHtml(formToken)}">
+          <div class="hp-field" aria-hidden="true">
+            <label for="website">No rellenar</label>
+            <input id="website" name="website" type="text" tabindex="-1" autocomplete="off">
+          </div>
           <label for="url">URL de destino</label>
           <div class="field-row">
             <input
@@ -225,7 +240,39 @@ export function renderHomePage({
             >
             <button class="button button-primary" type="submit">Acortar</button>
           </div>
-          <p class="hint" id="url-hint">Solo http y https · máximo 4.096 caracteres</p>
+          <div class="form-grid">
+            <div class="field">
+              <label for="alias">Alias propio <span>opcional</span></label>
+              <input
+                id="alias"
+                name="alias"
+                type="text"
+                autocomplete="off"
+                autocapitalize="none"
+                spellcheck="false"
+                pattern="[A-Za-z0-9_-]{3,32}"
+                minlength="3"
+                maxlength="32"
+                placeholder="mi-enlace"
+                value="${escapeHtml(submittedAlias)}"
+              >
+            </div>
+            <div class="field">
+              <label for="expiresAt">Caducidad <span>opcional, UTC</span></label>
+              <input
+                id="expiresAt"
+                name="expiresAt"
+                type="datetime-local"
+                value="${escapeHtml(submittedExpiresAt)}"
+                ${minExpiration ? `min="${escapeHtml(minExpiration)}"` : ''}
+              >
+            </div>
+          </div>
+          <p class="hint" id="url-hint">
+            Solo http y https · máximo 4.096 caracteres.
+            El alias admite 3–32 letras, números, guion o guion bajo.
+            La caducidad va de 5 minutos a 1 año.
+          </p>
         </form>
         <p class="privacy">
           No pedimos correo ni contraseña. La IP se usa solo para límites de

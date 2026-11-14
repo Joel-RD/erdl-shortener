@@ -37,6 +37,7 @@ const CREATE_ERROR_STATUS: Record<CreateLinkErrorCode, number> = {
   alias_invalid: 400,
   alias_reserved: 400,
   alias_taken: 409,
+  domain_blocked: 422,
   expiration_invalid: 400,
   quota_exceeded: 429,
 };

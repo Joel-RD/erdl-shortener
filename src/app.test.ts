@@ -3,6 +3,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Express } from 'express';
 import type { Client } from '@libsql/client';
 import { createClickBuffer } from './abuse/click-buffer.js';
+import {
+  createFormToken,
+  FORM_HONEYPOT_FIELD,
+  FORM_TOKEN_FIELD,
+} from './abuse/form-token.js';
 import { createApp, getAppRuntime, type AppRuntime } from './app.js';
 import { config } from './config.js';
 import {
@@ -11,9 +16,25 @@ import {
 } from './testing/temp-db.js';
 
 const ABUSE_EMAIL = 'abuso@example.com';
+const FORM_SECRET = 'test-form-secret-0123456789';
 const UNLIMITED = [
   { name: 'test', limit: 1_000_000, windowMs: 60_000 },
 ] as const;
+
+function formToken(ageMs = 0): string {
+  return createFormToken(FORM_SECRET, new Date(Date.now() - ageMs));
+}
+
+function formBody(
+  fields: Record<string, string>,
+  options: { ageMs?: number; honeypot?: string } = {},
+): Record<string, string> {
+  return {
+    ...fields,
+    [FORM_TOKEN_FIELD]: formToken(options.ageMs ?? 0),
+    [FORM_HONEYPOT_FIELD]: options.honeypot ?? '',
+  };
+}
 
 let app: Express;
 let runtime: AppRuntime;
@@ -26,6 +47,8 @@ beforeAll(async () => {
   app = createApp({
     db,
     abuseContactEmail: ABUSE_EMAIL,
+    formTokenSecret: FORM_SECRET,
+    formTokenMinAgeMs: 0,
     // Los tests no deben chocar con las cuotas de producción; el límite real
     // se prueba aparte con una app dedicada.
     limits: {
@@ -199,6 +222,29 @@ describe('API de enlaces', () => {
     expect(unknownField.body.error).toBe('invalid_request');
   });
 
+  it('acepta una expiración válida y rechaza fechas fuera de rango', async () => {
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    const valid = await request(app)
+      .post('/api/v1/links')
+      .send({
+        url: 'https://example.com/api-expira',
+        alias: 'api-expira',
+        expiresAt,
+      });
+    const tooSoon = await request(app)
+      .post('/api/v1/links')
+      .send({
+        url: 'https://example.com/api-pronto',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+
+    expect(valid.status).toBe(201);
+    expect(valid.body.expiresAt).toBe(expiresAt);
+    expect(tooSoon.status).toBe(400);
+    expect(tooSoon.body.error).toBe('expiration_invalid');
+  });
+
   it('devuelve 410 para enlaces deshabilitados y vencidos', async () => {
     await request(app)
       .post('/api/v1/links')
@@ -340,13 +386,37 @@ describe('interfaz SSR', () => {
     expect(response.text).toContain('src="/app.js"');
     expect(response.text).toContain(`mailto:${ABUSE_EMAIL}`);
     expect(response.text).toContain('href="/styles.css"');
+    expect(response.text).toContain('name="_formToken"');
+    expect(response.text).toContain('name="alias"');
+    expect(response.text).toContain('name="expiresAt"');
+    expect(response.text).toContain('name="website"');
+  });
+
+  it('acepta el token honeypot que renderiza GET /', async () => {
+    const home = await request(app)
+      .get('/')
+      .set('Accept', 'text/html');
+    const match = /name="_formToken" value="([^"]+)"/.exec(home.text);
+
+    expect(match?.[1]).toMatch(/^\d{13}\.[a-f0-9]{64}$/);
+
+    const response = await request(app)
+      .post('/links')
+      .type('form')
+      .send({
+        url: 'https://example.com/token-renderizado',
+        [FORM_TOKEN_FIELD]: match?.[1] ?? '',
+        [FORM_HONEYPOT_FIELD]: '',
+      });
+
+    expect(response.status).toBe(303);
   });
 
   it('crea por formulario con 303 y muestra la tarjeta', async () => {
     const created = await request(app)
       .post('/links')
       .type('form')
-      .send({ url: 'https://example.com/formulario' });
+      .send(formBody({ url: 'https://example.com/formulario' }));
 
     expect(created.status).toBe(303);
     const location = String(created.headers.location);
@@ -366,12 +436,63 @@ describe('interfaz SSR', () => {
     expect(page.text).toContain('Copiar enlace');
   });
 
+  it('acepta alias propio y caducidad desde el formulario', async () => {
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 16);
+
+    const created = await request(app)
+      .post('/links')
+      .type('form')
+      .send(
+        formBody({
+          url: 'https://example.com/formulario-avanzado',
+          alias: 'alias-form',
+          expiresAt,
+        }),
+      );
+
+    expect(created.status).toBe(303);
+    expect(created.headers.location).toBe('/?created=alias-form');
+
+    const metadata = await request(app).get('/api/v1/links/alias-form');
+
+    expect(metadata.status).toBe(200);
+    expect(metadata.body.alias).toBe('alias-form');
+    expect(metadata.body.expiresAt).toMatch(/Z$/);
+  });
+
+  it('devuelve 409 si se repite el alias desde el formulario', async () => {
+    const first = await request(app)
+      .post('/links')
+      .type('form')
+      .send(
+        formBody({
+          url: 'https://example.com/form-alias-1',
+          alias: 'form-repetido',
+        }),
+      );
+    const second = await request(app)
+      .post('/links')
+      .type('form')
+      .send(
+        formBody({
+          url: 'https://example.com/form-alias-2',
+          alias: 'form-repetido',
+        }),
+      );
+
+    expect(first.status).toBe(303);
+    expect(second.status).toBe(409);
+    expect(second.text).toContain('ya está en uso');
+  });
+
   it('devuelve 422 y escapa la URL enviada cuando es inválida', async () => {
     const malicious = '<script>alert(1)</script>';
     const response = await request(app)
       .post('/links')
       .type('form')
-      .send({ url: malicious });
+      .send(formBody({ url: malicious }));
 
     expect(response.status).toBe(422);
     expect(response.text).not.toContain(malicious);
@@ -379,6 +500,21 @@ describe('interfaz SSR', () => {
       '&lt;script&gt;alert(1)&lt;/script&gt;',
     );
     expect(response.text).toContain('No se pudo crear el enlace');
+  });
+
+  it('rechaza una caducidad de formulario mal formada', async () => {
+    const response = await request(app)
+      .post('/links')
+      .type('form')
+      .send(
+        formBody({
+          url: 'https://example.com/fecha-mala',
+          expiresAt: '2026-02-31T10:00',
+        }),
+      );
+
+    expect(response.status).toBe(422);
+    expect(response.text).toContain('La fecha de caducidad no es válida');
   });
 
   it('escapa los datos de la tarjeta aunque la DB contenga HTML', async () => {
@@ -411,5 +547,177 @@ describe('interfaz SSR', () => {
 
     expect(response.status).toBe(200);
     expect(response.text).not.toContain('<script>alert(1)</script>');
+  });
+});
+
+describe('abuso II: blocklist, honeypot y administración', () => {
+  it('rechaza un dominio de la blocklist con 422 genérico', async () => {
+    const response = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://bit.ly/enlace-encadenado' });
+
+    expect(response.status).toBe(422);
+    expect(response.body).toEqual(
+      expect.objectContaining({ error: 'domain_blocked' }),
+    );
+    expect(String(response.body.message)).not.toContain('bit.ly');
+  });
+
+  it('protege las rutas admin y el takedown invalida la caché', async () => {
+    const created = await request(app)
+      .post('/api/v1/links')
+      .send({
+        url: 'https://example.com/takedown',
+        alias: 'takedown-cache',
+      });
+
+    expect(created.status).toBe(201);
+
+    // Calentar la caché de resolución: sin invalidación, este GET seguiría
+    // redirigiendo hasta el TTL de 60 s.
+    const warm = await request(app).get('/takedown-cache');
+    expect(warm.status).toBe(302);
+
+    const noAuth = await request(app).delete(
+      '/api/v1/links/takedown-cache',
+    );
+    const wrongAuth = await request(app)
+      .delete('/api/v1/links/takedown-cache')
+      .set('Authorization', 'Bearer token-equivocado');
+
+    expect(noAuth.status).toBe(401);
+    expect(wrongAuth.status).toBe(401);
+
+    const removed = await request(app)
+      .delete('/api/v1/links/takedown-cache')
+      .set('Authorization', `Bearer ${config.adminToken}`);
+
+    expect(removed.status).toBe(204);
+
+    const afterTakedown = await request(app).get('/takedown-cache');
+    const metadata = await request(app).get(
+      '/api/v1/links/takedown-cache',
+    );
+
+    expect(afterTakedown.status).toBe(410);
+    expect(afterTakedown.body).toEqual({ error: 'gone' });
+    expect(metadata.status).toBe(410);
+
+    // Idempotente: repetir el takedown no borra la fila ni da 404.
+    const again = await request(app)
+      .delete('/api/v1/links/takedown-cache')
+      .set('Authorization', `Bearer ${config.adminToken}`);
+    const missing = await request(app)
+      .delete('/api/v1/links/no-existe-admin')
+      .set('Authorization', `Bearer ${config.adminToken}`);
+
+    expect(again.status).toBe(204);
+    expect(missing.status).toBe(404);
+  });
+
+  it('añade y desactiva dominios de la blocklist en caliente', async () => {
+    const noAuth = await request(app)
+      .post('/api/v1/admin/blocklist')
+      .send({ domain: 'bloqueo-admin.test' });
+    const invalid = await request(app)
+      .post('/api/v1/admin/blocklist')
+      .set('Authorization', `Bearer ${config.adminToken}`)
+      .send({ domain: 'localhost' });
+
+    expect(noAuth.status).toBe(401);
+    expect(invalid.status).toBe(400);
+
+    const added = await request(app)
+      .post('/api/v1/admin/blocklist')
+      .set('Authorization', `Bearer ${config.adminToken}`)
+      .send({ domain: 'https://sub.bloqueo-admin.test/ruta' });
+
+    expect(added.status).toBe(201);
+    expect(added.body).toEqual({
+      domain: 'bloqueo-admin.test',
+      source: 'manual',
+      enabled: true,
+    });
+
+    const blocked = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://otro.bloqueo-admin.test/destino' });
+
+    expect(blocked.status).toBe(422);
+    expect(blocked.body.error).toBe('domain_blocked');
+
+    const disabled = await request(app)
+      .post('/api/v1/admin/blocklist')
+      .set('Authorization', `Bearer ${config.adminToken}`)
+      .send({ domain: 'bloqueo-admin.test', enabled: false });
+
+    expect(disabled.status).toBe(201);
+    expect(disabled.body.enabled).toBe(false);
+
+    const allowed = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://tercero.bloqueo-admin.test/destino' });
+
+    expect(allowed.status).toBe(201);
+  });
+
+  it('rechaza el formulario sin token, demasiado rápido o con honeypot', async () => {
+    const strictDatabase = await createTempDatabase();
+    const strictApp = createApp({
+      db: strictDatabase.client,
+      formTokenSecret: FORM_SECRET,
+      formTokenMinAgeMs: 5_000,
+      limits: {
+        createIp: UNLIMITED,
+        createGlobal: [],
+        redirectIp: [],
+      },
+    });
+    const strictRuntime = getAppRuntime(strictApp);
+
+    try {
+      const missing = await request(strictApp)
+        .post('/links')
+        .type('form')
+        .send({
+          url: 'https://example.com/sin-token',
+          [FORM_HONEYPOT_FIELD]: '',
+        });
+
+      const tooFast = await request(strictApp)
+        .post('/links')
+        .type('form')
+        .send(formBody({ url: 'https://example.com/demasiado-rapido' }));
+
+      const honeypot = await request(strictApp)
+        .post('/links')
+        .type('form')
+        .send(
+          formBody(
+            { url: 'https://example.com/honeypot' },
+            { ageMs: 6_000, honeypot: 'soy-un-bot' },
+          ),
+        );
+
+      expect(missing.status).toBe(400);
+      expect(tooFast.status).toBe(400);
+      expect(honeypot.status).toBe(400);
+      expect(honeypot.text).toContain('No se pudo validar el formulario');
+
+      const valid = await request(strictApp)
+        .post('/links')
+        .type('form')
+        .send(
+          formBody(
+            { url: 'https://example.com/formulario-lento' },
+            { ageMs: 6_000 },
+          ),
+        );
+
+      expect(valid.status).toBe(303);
+    } finally {
+      await strictRuntime.close();
+      await strictDatabase.cleanup();
+    }
   });
 });

@@ -48,6 +48,18 @@ const envSchema = z.object({
   IP_HASH_SECRET: z
     .string()
     .min(16, 'IP_HASH_SECRET debe tener al menos 16 caracteres'),
+  // Secreto para firmar el honeypot del formulario. Si no se define, se usa
+  // ADMIN_TOKEN como respaldo (los mensajes HMAC están separados por dominio).
+  FORM_TOKEN_SECRET: z.preprocess(
+    (value) =>
+      typeof value === 'string' && value.trim() === '' ? undefined : value,
+    z
+      .string()
+      .min(16, 'FORM_TOKEN_SECRET debe tener al menos 16 caracteres')
+      .optional(),
+  ),
+  // Días que se conserva el HMAC de la IP antes de anonimizarlo.
+  IP_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(45),
   LOG_LEVEL: z.enum(logLevels).default('info'),
   // 0 = sin proxy (local). En Render debe ser 1.
   TRUST_PROXY: z.coerce.number().int().min(0).max(10).default(0),
@@ -74,6 +86,8 @@ export type Config = {
   baseUrl: string;
   adminToken: string;
   ipHashSecret: string;
+  formTokenSecret: string | undefined;
+  retentionDays: number;
   logLevel: (typeof logLevels)[number];
   trustProxy: number;
   databaseUrl: string;
@@ -103,6 +117,8 @@ export function parseConfig(
     baseUrl: data.BASE_URL,
     adminToken: data.ADMIN_TOKEN,
     ipHashSecret: data.IP_HASH_SECRET,
+    formTokenSecret: data.FORM_TOKEN_SECRET,
+    retentionDays: data.IP_RETENTION_DAYS,
     logLevel: data.LOG_LEVEL,
     trustProxy: data.TRUST_PROXY,
     databaseUrl: data.DATABASE_URL,
