@@ -1,20 +1,76 @@
 import { Router } from 'express';
+import type {
+  RateLimiter,
+  RateLimitRule,
+} from '../abuse/rate-limit.js';
 import type { LinkService } from '../links/service.js';
 import { renderErrorPage } from '../ui/pages.js';
-import { wantsHtml } from './shared.js';
+import {
+  enforceRedirectRateLimits,
+  getClientIpHash,
+  setRetryAfter,
+  wantsHtml,
+} from './shared.js';
 
 export type RedirectRouterOptions = {
   service: LinkService;
   abuseContactEmail?: string | undefined;
+  rateLimiter: RateLimiter;
+  ipHashSecret: string;
+  redirectIpRules: readonly RateLimitRule[];
+  now: () => Date;
 };
 
 export function createRedirectRouter({
   service,
   abuseContactEmail,
+  rateLimiter,
+  ipHashSecret,
+  redirectIpRules,
+  now,
 }: RedirectRouterOptions): Router {
   const router = Router();
 
   router.get('/:alias', async (req, res) => {
+    const ipHash = getClientIpHash(req, ipHashSecret);
+    const limited = enforceRedirectRateLimits(
+      rateLimiter,
+      ipHash,
+      redirectIpRules,
+      now().getTime(),
+    );
+
+    if (limited) {
+      res.set({
+        'Cache-Control': 'no-store',
+        'X-Robots-Tag': 'noindex, nofollow',
+      });
+      setRetryAfter(res, limited);
+
+      if (wantsHtml(req)) {
+        res
+          .status(429)
+          .type('html')
+          .send(
+            renderErrorPage({
+              status: 429,
+              title: 'Demasiadas peticiones',
+              message:
+                'Has hecho demasiadas peticiones seguidas. Espera un momento y vuelve a intentarlo.',
+              abuseContactEmail,
+            }),
+          );
+        return;
+      }
+
+      res.status(429).json({
+        error: 'rate_limited',
+        message: 'Demasiadas peticiones. Inténtalo de nuevo más tarde.',
+        retryAfter: limited.retryAfterSeconds,
+      });
+      return;
+    }
+
     const alias = req.params.alias ?? '';
     const result = await service.resolve(alias);
 

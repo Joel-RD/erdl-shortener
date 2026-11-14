@@ -1,11 +1,20 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import type {
+  RateLimiter,
+  RateLimitRule,
+} from '../abuse/rate-limit.js';
 import {
   type CreateLinkErrorCode,
   type CreateLinkInput,
   type LinkService,
 } from '../links/service.js';
-import { toLinkResponse } from './shared.js';
+import {
+  enforceCreateRateLimits,
+  getClientIpHash,
+  setRetryAfter,
+  toLinkResponse,
+} from './shared.js';
 
 const createLinkSchema = z
   .object({
@@ -29,20 +38,50 @@ const CREATE_ERROR_STATUS: Record<CreateLinkErrorCode, number> = {
   alias_reserved: 400,
   alias_taken: 409,
   expiration_invalid: 400,
+  quota_exceeded: 429,
 };
 
 export type ApiLinksRouterOptions = {
   service: LinkService;
   baseUrl: string;
+  rateLimiter: RateLimiter;
+  ipHashSecret: string;
+  createIpRules: readonly RateLimitRule[];
+  createGlobalRules: readonly RateLimitRule[];
+  now: () => Date;
 };
 
 export function createApiLinksRouter({
   service,
   baseUrl,
+  rateLimiter,
+  ipHashSecret,
+  createIpRules,
+  createGlobalRules,
+  now,
 }: ApiLinksRouterOptions): Router {
   const router = Router();
 
   router.post('/links', async (req, res) => {
+    const ipHash = getClientIpHash(req, ipHashSecret);
+    const limited = enforceCreateRateLimits(
+      rateLimiter,
+      ipHash,
+      createIpRules,
+      createGlobalRules,
+      now().getTime(),
+    );
+
+    if (limited) {
+      setRetryAfter(res, limited);
+      res.status(429).json({
+        error: 'rate_limited',
+        message: 'Demasiadas creaciones. Inténtalo de nuevo más tarde.',
+        retryAfter: limited.retryAfterSeconds,
+      });
+      return;
+    }
+
     const parsed = createLinkSchema.safeParse(req.body ?? {});
 
     if (!parsed.success) {
@@ -57,7 +96,10 @@ export function createApiLinksRouter({
       return;
     }
 
-    const input: CreateLinkInput = { url: parsed.data.url };
+    const input: CreateLinkInput = {
+      url: parsed.data.url,
+      createdIpHash: ipHash,
+    };
 
     if (parsed.data.alias !== undefined) {
       input.alias = parsed.data.alias;

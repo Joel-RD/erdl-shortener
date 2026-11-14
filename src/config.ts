@@ -44,6 +44,10 @@ const envSchema = z.object({
   ADMIN_TOKEN: z
     .string()
     .min(16, 'ADMIN_TOKEN debe tener al menos 16 caracteres'),
+  // Secreto independiente para HMAC de IPs (límites, cuota y dedupe).
+  IP_HASH_SECRET: z
+    .string()
+    .min(16, 'IP_HASH_SECRET debe tener al menos 16 caracteres'),
   LOG_LEVEL: z.enum(logLevels).default('info'),
   // 0 = sin proxy (local). En Render debe ser 1.
   TRUST_PROXY: z.coerce.number().int().min(0).max(10).default(0),
@@ -69,6 +73,7 @@ export type Config = {
   port: number;
   baseUrl: string;
   adminToken: string;
+  ipHashSecret: string;
   logLevel: (typeof logLevels)[number];
   trustProxy: number;
   databaseUrl: string;
@@ -97,6 +102,7 @@ export function parseConfig(
     port: data.PORT,
     baseUrl: data.BASE_URL,
     adminToken: data.ADMIN_TOKEN,
+    ipHashSecret: data.IP_HASH_SECRET,
     logLevel: data.LOG_LEVEL,
     trustProxy: data.TRUST_PROXY,
     databaseUrl: data.DATABASE_URL,

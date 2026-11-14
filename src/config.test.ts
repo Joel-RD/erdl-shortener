@@ -4,6 +4,7 @@ import { parseConfig } from './config.js';
 const validEnv = {
   BASE_URL: 'https://short.test/',
   ADMIN_TOKEN: '0123456789abcdef',
+  IP_HASH_SECRET: 'fedcba9876543210',
 };
 
 describe('parseConfig', () => {
@@ -51,6 +52,12 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ BASE_URL: validEnv.BASE_URL })).toThrow(
       /ADMIN_TOKEN/,
     );
+  });
+
+  it('falla si IP_HASH_SECRET no está definido', () => {
+    const { IP_HASH_SECRET: _ignored, ...withoutSecret } = validEnv;
+
+    expect(() => parseConfig(withoutSecret)).toThrow(/IP_HASH_SECRET/);
   });
 
   it('rechaza BASE_URL con un protocolo distinto de http/https', () => {

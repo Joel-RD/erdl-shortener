@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Client, Row } from '@libsql/client';
+import type { AliasCache } from '../cache/alias-cache.js';
+import type { ClickBuffer } from '../abuse/click-buffer.js';
 import {
   generateAlias,
   validateCustomAlias,
@@ -14,13 +16,15 @@ import {
  * Reglas de negocio de los enlaces.
  *
  * Las rutas no deciden nada: llaman aquí y traducen el resultado a HTTP. El
- * servicio orquesta validación, generación/validación de alias y persistencia.
- * La caché, el buffer de clics y las cuotas llegarán en fases posteriores.
+ * servicio orquesta validación, dedupe, cuota, generación/validación de alias,
+ * persistencia, caché de resolución y buffer de clics.
  */
 
 const GENERATED_ALIAS_ATTEMPTS = 5;
 const MIN_EXPIRATION_MS = 5 * 60 * 1000;
 const MAX_EXPIRATION_MS = 365 * 24 * 60 * 60 * 1000;
+export const DEFAULT_DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_MAX_ACTIVE_LINKS_PER_IP = 50;
 
 const SELECT_COLUMNS = `
   alias, url, url_hash, domain, created_ip_hash, created_at, expires_at,
@@ -41,6 +45,12 @@ export type LinkRecord = {
   disabledReason: string | null;
 };
 
+/** Lo mínimo que necesita el redirect y lo que se guarda en caché. */
+export type ResolvedLink = Pick<
+  LinkRecord,
+  'alias' | 'url' | 'expiresAt' | 'disabledAt'
+>;
+
 /** Datos que pueden mostrarse sin autenticación. */
 export type PublicLink = {
   alias: string;
@@ -55,7 +65,7 @@ export type CreateLinkInput = {
   url: string;
   alias?: string | undefined;
   expiresAt?: Date | null | undefined;
-  /** HMAC de la IP; en la Fase 3 todavía no se calcula. */
+  /** HMAC de la IP; sin él no hay dedupe ni cuota (tests/dev). */
   createdIpHash?: string | null | undefined;
 };
 
@@ -63,11 +73,16 @@ export type CreateLinkErrorCode =
   | UrlErrorCode
   | AliasErrorCode
   | 'alias_taken'
-  | 'expiration_invalid';
+  | 'expiration_invalid'
+  | 'quota_exceeded';
 
 export type CreateLinkResult =
   | { ok: true; link: LinkRecord }
   | { ok: false; code: CreateLinkErrorCode; message: string };
+
+export type ResolveResult =
+  | { ok: true; link: ResolvedLink }
+  | { ok: false; reason: 'not_found' | 'gone' };
 
 export type LookupResult =
   | { ok: true; link: LinkRecord }
@@ -75,13 +90,19 @@ export type LookupResult =
 
 export type LinkService = {
   create(input: CreateLinkInput): Promise<CreateLinkResult>;
-  resolve(alias: string): Promise<LookupResult>;
+  resolve(alias: string): Promise<ResolveResult>;
   getMetadata(alias: string): Promise<LookupResult>;
+  /** Invalida la caché de un alias (lo usará el takedown de la Fase 7). */
+  invalidate(alias: string): void;
 };
 
 export type LinkServiceOptions = {
   db: Client;
   now?: (() => Date) | undefined;
+  cache?: AliasCache | undefined;
+  clickBuffer?: Pick<ClickBuffer, 'record'> | undefined;
+  dedupeWindowMs?: number | undefined;
+  maxActiveLinksPerIp?: number | undefined;
 };
 
 function hashUrl(url: string): string {
@@ -108,6 +129,15 @@ function toLinkRecord(row: Row): LinkRecord {
   };
 }
 
+function toResolvedLink(link: LinkRecord): ResolvedLink {
+  return {
+    alias: link.alias,
+    url: link.url,
+    expiresAt: link.expiresAt,
+    disabledAt: link.disabledAt,
+  };
+}
+
 export function toPublicLink(link: LinkRecord): PublicLink {
   return {
     alias: link.alias,
@@ -119,7 +149,10 @@ export function toPublicLink(link: LinkRecord): PublicLink {
   };
 }
 
-function isGone(link: LinkRecord, now: Date): boolean {
+function isGone(
+  link: Pick<ResolvedLink, 'disabledAt' | 'expiresAt'>,
+  now: Date,
+): boolean {
   if (link.disabledAt !== null) return true;
 
   if (link.expiresAt !== null) {
@@ -133,6 +166,10 @@ function isGone(link: LinkRecord, now: Date): boolean {
 export function createLinkService({
   db,
   now = () => new Date(),
+  cache,
+  clickBuffer,
+  dedupeWindowMs = DEFAULT_DEDUPE_WINDOW_MS,
+  maxActiveLinksPerIp = DEFAULT_MAX_ACTIVE_LINKS_PER_IP,
 }: LinkServiceOptions): LinkService {
   async function findByAlias(alias: string): Promise<LinkRecord | null> {
     const result = await db.execute({
@@ -144,22 +181,52 @@ export function createLinkService({
     return row ? toLinkRecord(row) : null;
   }
 
-  async function lookup(alias: string): Promise<LookupResult> {
-    const link = await findByAlias(alias);
+  async function findRecentDuplicate(
+    urlHash: string,
+    createdIpHash: string,
+    current: Date,
+  ): Promise<LinkRecord | null> {
+    const since = new Date(
+      current.getTime() - dedupeWindowMs,
+    ).toISOString();
 
-    if (!link) return { ok: false, reason: 'not_found' };
-    if (isGone(link, now())) return { ok: false, reason: 'gone' };
+    const result = await db.execute({
+      sql: `SELECT ${SELECT_COLUMNS}
+              FROM links
+             WHERE url_hash = ?
+               AND created_ip_hash = ?
+               AND created_at >= ?
+               AND disabled_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?)
+             ORDER BY created_at DESC
+             LIMIT 1`,
+      args: [urlHash, createdIpHash, since, current.toISOString()],
+    });
 
-    return { ok: true, link };
+    const row = result.rows[0];
+    return row ? toLinkRecord(row) : null;
   }
 
-  function validateExpiration(expiresAt: Date | null | undefined): {
-    ok: true;
-    value: string | null;
-  } | {
-    ok: false;
-    message: string;
-  } {
+  async function countActiveLinks(
+    createdIpHash: string,
+    current: Date,
+  ): Promise<number> {
+    const result = await db.execute({
+      sql: `SELECT COUNT(*) AS total
+              FROM links
+             WHERE created_ip_hash = ?
+               AND disabled_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?)`,
+      args: [createdIpHash, current.toISOString()],
+    });
+
+    return Number(result.rows[0]?.total ?? 0);
+  }
+
+  function validateExpiration(
+    expiresAt: Date | null | undefined,
+    current: Date,
+  ): { ok: true; value: string | null } | { ok: false; message: string } {
     if (expiresAt === null || expiresAt === undefined) {
       return { ok: true, value: null };
     }
@@ -170,16 +237,16 @@ export function createLinkService({
       return { ok: false, message: 'La fecha de expiración no es válida.' };
     }
 
-    const current = now().getTime();
+    const currentMs = current.getTime();
 
-    if (timestamp < current + MIN_EXPIRATION_MS) {
+    if (timestamp < currentMs + MIN_EXPIRATION_MS) {
       return {
         ok: false,
         message: 'La expiración debe ser al menos 5 minutos posterior a ahora.',
       };
     }
 
-    if (timestamp > current + MAX_EXPIRATION_MS) {
+    if (timestamp > currentMs + MAX_EXPIRATION_MS) {
       return {
         ok: false,
         message: 'La expiración no puede superar un año desde ahora.',
@@ -201,7 +268,8 @@ export function createLinkService({
         };
       }
 
-      const expiration = validateExpiration(input.expiresAt);
+      const current = now();
+      const expiration = validateExpiration(input.expiresAt, current);
 
       if (!expiration.ok) {
         return {
@@ -212,9 +280,11 @@ export function createLinkService({
       }
 
       const customAlias = input.alias?.trim();
-      let alias: string;
+      const wantsCustomAlias =
+        customAlias !== undefined && customAlias !== '';
+      let validatedCustomAlias: string | null = null;
 
-      if (customAlias !== undefined && customAlias !== '') {
+      if (wantsCustomAlias) {
         const validatedAlias = validateCustomAlias(customAlias);
 
         if (!validatedAlias.ok) {
@@ -225,27 +295,54 @@ export function createLinkService({
           };
         }
 
-        alias = validatedAlias.alias;
-      } else {
-        alias = generateAlias();
+        validatedCustomAlias = validatedAlias.alias;
       }
 
       const urlHash = hashUrl(validated.value.url);
       const createdIpHash = input.createdIpHash ?? null;
-      const attempts = customAlias ? 1 : GENERATED_ALIAS_ATTEMPTS;
+
+      if (createdIpHash !== null) {
+        // Dedupe solo para alias generados: si la persona pidió un alias
+        // concreto, ese alias manda y la colisión se resuelve aparte.
+        if (!wantsCustomAlias) {
+          const duplicate = await findRecentDuplicate(
+            urlHash,
+            createdIpHash,
+            current,
+          );
+
+          if (duplicate) return { ok: true, link: duplicate };
+        }
+
+        const activeLinks = await countActiveLinks(createdIpHash, current);
+
+        if (activeLinks >= maxActiveLinksPerIp) {
+          return {
+            ok: false,
+            code: 'quota_exceeded',
+            message:
+              'Has alcanzado el límite de enlaces activos para tu IP. Espera a que caduquen algunos.',
+          };
+        }
+      }
+
+      let alias = validatedCustomAlias ?? generateAlias();
+      const attempts = validatedCustomAlias ? 1 : GENERATED_ALIAS_ATTEMPTS;
 
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         try {
           await db.execute({
             sql: `INSERT INTO links
-                    (alias, url, url_hash, domain, created_ip_hash, expires_at)
-                  VALUES (?, ?, ?, ?, ?, ?)`,
+                    (alias, url, url_hash, domain, created_ip_hash,
+                     created_at, expires_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
             args: [
               alias,
               validated.value.url,
               urlHash,
               validated.value.domain,
               createdIpHash,
+              current.toISOString(),
               expiration.value,
             ],
           });
@@ -256,7 +353,7 @@ export function createLinkService({
 
           if (!existing) throw error;
 
-          if (customAlias) {
+          if (validatedCustomAlias) {
             return {
               ok: false,
               code: 'alias_taken',
@@ -282,12 +379,43 @@ export function createLinkService({
       );
     },
 
-    resolve(alias) {
-      return lookup(alias);
+    async resolve(alias) {
+      const current = now();
+      const cached = cache?.get(alias, current);
+
+      if (cached) {
+        if (isGone(cached, current)) {
+          cache?.delete(alias);
+          return { ok: false, reason: 'gone' };
+        }
+
+        clickBuffer?.record(alias, current);
+        return { ok: true, link: cached };
+      }
+
+      const link = await findByAlias(alias);
+
+      if (!link) return { ok: false, reason: 'not_found' };
+      if (isGone(link, current)) return { ok: false, reason: 'gone' };
+
+      const resolved = toResolvedLink(link);
+      cache?.set(resolved, current);
+      clickBuffer?.record(alias, current);
+
+      return { ok: true, link: resolved };
     },
 
-    getMetadata(alias) {
-      return lookup(alias);
+    async getMetadata(alias) {
+      const link = await findByAlias(alias);
+
+      if (!link) return { ok: false, reason: 'not_found' };
+      if (isGone(link, now())) return { ok: false, reason: 'gone' };
+
+      return { ok: true, link };
+    },
+
+    invalidate(alias) {
+      cache?.delete(alias);
     },
   };
 }

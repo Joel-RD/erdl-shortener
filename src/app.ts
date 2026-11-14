@@ -2,6 +2,16 @@ import { fileURLToPath } from 'node:url';
 import express, { type ErrorRequestHandler } from 'express';
 import helmet from 'helmet';
 import { pinoHttp } from 'pino-http';
+import { createClickBuffer, type ClickBuffer } from './abuse/click-buffer.js';
+import {
+  createMemoryRateLimiter,
+  DEFAULT_CREATE_GLOBAL_RULES,
+  DEFAULT_CREATE_IP_RULES,
+  DEFAULT_REDIRECT_IP_RULES,
+  type RateLimiter,
+  type RateLimitRule,
+} from './abuse/rate-limit.js';
+import { createAliasCache, type AliasCache } from './cache/alias-cache.js';
 import { config } from './config.js';
 import { db as defaultDb, type DatabaseClient } from './db/client.js';
 import { createLinkService } from './links/service.js';
@@ -12,11 +22,37 @@ import { wantsHtml } from './routes/shared.js';
 import { renderErrorPage } from './ui/pages.js';
 import { logger } from './logger.js';
 
+export type AppRateLimits = {
+  createIp?: readonly RateLimitRule[] | undefined;
+  createGlobal?: readonly RateLimitRule[] | undefined;
+  redirectIp?: readonly RateLimitRule[] | undefined;
+};
+
 export type AppOptions = {
   db?: DatabaseClient | undefined;
   now?: (() => Date) | undefined;
   abuseContactEmail?: string | undefined;
+  cache?: AliasCache | undefined;
+  clickBuffer?: ClickBuffer | undefined;
+  rateLimiter?: RateLimiter | undefined;
+  ipHashSecret?: string | undefined;
+  limits?: AppRateLimits | undefined;
+  maxActiveLinksPerIp?: number | undefined;
+  dedupeWindowMs?: number | undefined;
 };
+
+/** Piezas con estado que el arranque/apagado necesitan conocer. */
+export type AppRuntime = {
+  cache: AliasCache;
+  clickBuffer: ClickBuffer;
+  rateLimiter: RateLimiter;
+  /** Vacía clics pendientes y detiene los timers. */
+  close: () => Promise<void>;
+};
+
+export function getAppRuntime(app: express.Express): AppRuntime {
+  return app.locals.runtime as AppRuntime;
+}
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 
@@ -25,7 +61,46 @@ export function createApp(options: AppOptions = {}): express.Express {
   const db = options.db ?? defaultDb;
   const abuseContactEmail =
     options.abuseContactEmail ?? config.abuseContactEmail;
-  const service = createLinkService({ db, now: options.now });
+  const now = options.now ?? (() => new Date());
+  const ipHashSecret = options.ipHashSecret ?? config.ipHashSecret;
+
+  const cache = options.cache ?? createAliasCache();
+  const clickBuffer =
+    options.clickBuffer ?? createClickBuffer({ db, now });
+  const rateLimiter =
+    options.rateLimiter ??
+    createMemoryRateLimiter({ now: () => now().getTime() });
+
+  const createIpRules =
+    options.limits?.createIp ?? DEFAULT_CREATE_IP_RULES;
+  const createGlobalRules =
+    options.limits?.createGlobal ?? DEFAULT_CREATE_GLOBAL_RULES;
+  const redirectIpRules =
+    options.limits?.redirectIp ?? DEFAULT_REDIRECT_IP_RULES;
+
+  const service = createLinkService({
+    db,
+    now,
+    cache,
+    clickBuffer,
+    maxActiveLinksPerIp: options.maxActiveLinksPerIp,
+    dedupeWindowMs: options.dedupeWindowMs,
+  });
+
+  const runtime: AppRuntime = {
+    cache,
+    clickBuffer,
+    rateLimiter,
+    async close() {
+      try {
+        await clickBuffer.close();
+      } finally {
+        rateLimiter.close();
+      }
+    },
+  };
+
+  app.locals.runtime = runtime;
 
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy === 0 ? false : config.trustProxy);
@@ -78,12 +153,38 @@ export function createApp(options: AppOptions = {}): express.Express {
 
   app.use(
     '/api/v1',
-    createApiLinksRouter({ service, baseUrl: config.baseUrl }),
+    createApiLinksRouter({
+      service,
+      baseUrl: config.baseUrl,
+      rateLimiter,
+      ipHashSecret,
+      createIpRules,
+      createGlobalRules,
+      now,
+    }),
   );
   app.use(
-    createPagesRouter({ service, baseUrl: config.baseUrl, abuseContactEmail }),
+    createPagesRouter({
+      service,
+      baseUrl: config.baseUrl,
+      abuseContactEmail,
+      rateLimiter,
+      ipHashSecret,
+      createIpRules,
+      createGlobalRules,
+      now,
+    }),
   );
-  app.use(createRedirectRouter({ service, abuseContactEmail }));
+  app.use(
+    createRedirectRouter({
+      service,
+      abuseContactEmail,
+      rateLimiter,
+      ipHashSecret,
+      redirectIpRules,
+      now,
+    }),
+  );
 
   app.use((req, res) => {
     if (wantsHtml(req) && !req.path.startsWith('/api/')) {

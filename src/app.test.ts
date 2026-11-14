@@ -2,7 +2,8 @@ import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Express } from 'express';
 import type { Client } from '@libsql/client';
-import { createApp } from './app.js';
+import { createClickBuffer } from './abuse/click-buffer.js';
+import { createApp, getAppRuntime, type AppRuntime } from './app.js';
 import { config } from './config.js';
 import {
   createTempDatabase,
@@ -10,18 +11,35 @@ import {
 } from './testing/temp-db.js';
 
 const ABUSE_EMAIL = 'abuso@example.com';
+const UNLIMITED = [
+  { name: 'test', limit: 1_000_000, windowMs: 60_000 },
+] as const;
 
 let app: Express;
+let runtime: AppRuntime;
 let database: TempDatabase;
 let db: Client;
 
 beforeAll(async () => {
   database = await createTempDatabase();
   db = database.client;
-  app = createApp({ db, abuseContactEmail: ABUSE_EMAIL });
+  app = createApp({
+    db,
+    abuseContactEmail: ABUSE_EMAIL,
+    // Los tests no deben chocar con las cuotas de producción; el límite real
+    // se prueba aparte con una app dedicada.
+    limits: {
+      createIp: UNLIMITED,
+      createGlobal: [],
+      redirectIp: [],
+    },
+    clickBuffer: createClickBuffer({ db, intervalMs: 60_000 }),
+  });
+  runtime = getAppRuntime(app);
 });
 
 afterAll(async () => {
+  await runtime.close();
   await database.cleanup();
 });
 
@@ -225,6 +243,88 @@ describe('API de enlaces', () => {
 
     expect(response.status).toBe(404);
     expect(response.body).toEqual({ error: 'not_found' });
+  });
+});
+
+describe('abuso y rendimiento', () => {
+  it('deduplica la misma URL de la misma IP y guarda solo un HMAC', async () => {
+    const url = 'https://example.com/dedupe-app';
+
+    const first = await request(app)
+      .post('/api/v1/links')
+      .send({ url });
+    const second = await request(app)
+      .post('/api/v1/links')
+      .send({ url });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    expect(second.body.alias).toBe(first.body.alias);
+
+    const rows = await db.execute({
+      sql: 'SELECT created_ip_hash FROM links WHERE url = ?',
+      args: [url],
+    });
+
+    expect(rows.rows).toHaveLength(1);
+    expect(String(rows.rows[0]?.created_ip_hash)).toMatch(/^[a-f0-9]{64}$/);
+    expect(String(rows.rows[0]?.created_ip_hash)).not.toContain('127.0.0.1');
+  });
+
+  it('persiste los clics pendientes al vaciar el buffer', async () => {
+    const created = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://example.com/clics-app' });
+    const alias = String(created.body.alias);
+
+    await request(app).get(`/${alias}`);
+    await request(app).get(`/${alias}`);
+
+    const beforeFlush = await request(app).get(`/api/v1/links/${alias}`);
+    expect(beforeFlush.body.clicks).toBe(0);
+
+    await runtime.clickBuffer.flush();
+
+    const afterFlush = await request(app).get(`/api/v1/links/${alias}`);
+    expect(afterFlush.body.clicks).toBe(2);
+  });
+
+  it('devuelve 429 con Retry-After al superar 5 creaciones por minuto', async () => {
+    const limitedDatabase = await createTempDatabase();
+    const limitedApp = createApp({
+      db: limitedDatabase.client,
+      limits: {
+        createIp: [{ name: 'minute', limit: 5, windowMs: 60_000 }],
+        createGlobal: [],
+        redirectIp: [],
+      },
+    });
+    const limitedRuntime = getAppRuntime(limitedApp);
+
+    try {
+      for (let index = 0; index < 5; index += 1) {
+        const response = await request(limitedApp)
+          .post('/api/v1/links')
+          .send({ url: `https://example.com/limite/${index}` });
+
+        expect(response.status).toBe(201);
+      }
+
+      const sixth = await request(limitedApp)
+        .post('/api/v1/links')
+        .send({ url: 'https://example.com/limite/sexto' });
+
+      expect(sixth.status).toBe(429);
+      expect(sixth.body).toEqual(
+        expect.objectContaining({ error: 'rate_limited' }),
+      );
+      expect(sixth.headers['retry-after']).toMatch(/^\d+$/);
+      expect(Number(sixth.headers['retry-after'])).toBeGreaterThan(0);
+      expect(Number(sixth.headers['retry-after'])).toBeLessThanOrEqual(60);
+    } finally {
+      await limitedRuntime.close();
+      await limitedDatabase.cleanup();
+    }
   });
 });
 

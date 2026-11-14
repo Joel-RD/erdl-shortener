@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { createApp } from './app.js';
+import { createApp, getAppRuntime } from './app.js';
 import { config } from './config.js';
 import { configureDatabase, db } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
@@ -13,6 +13,7 @@ async function start(): Promise<void> {
   logger.info({ appliedMigrations }, 'database_ready');
 
   const app = createApp();
+  const runtime = getAppRuntime(app);
   const server = createServer(app);
 
   server.on('error', (error) => {
@@ -41,22 +42,34 @@ async function start(): Promise<void> {
     }, 10_000);
     forceExit.unref();
 
-    // Fase 5 añadirá aquí el flush del buffer de clics antes de cerrar la DB.
+    // Orden: dejar de aceptar conexiones → vaciar clics → cerrar la DB.
+    // Render manda SIGTERM en cada deploy, así que este camino es habitual.
     server.close((error) => {
-      if (error) {
-        logger.error({ err: error }, 'shutdown_failed');
-        process.exit(1);
-      }
+      void (async () => {
+        let exitCode = 0;
 
-      try {
-        db.close();
-      } catch (closeError) {
-        logger.error({ err: closeError }, 'database_close_failed');
-        process.exit(1);
-      }
+        if (error) {
+          logger.error({ err: error }, 'shutdown_failed');
+          exitCode = 1;
+        }
 
-      logger.info('shutdown_complete');
-      process.exit(0);
+        try {
+          await runtime.close();
+        } catch (closeError) {
+          logger.error({ err: closeError }, 'click_flush_failed');
+          exitCode = 1;
+        }
+
+        try {
+          db.close();
+        } catch (closeError) {
+          logger.error({ err: closeError }, 'database_close_failed');
+          exitCode = 1;
+        }
+
+        logger.info({ exitCode }, 'shutdown_complete');
+        process.exit(exitCode);
+      })();
     });
   }
 
