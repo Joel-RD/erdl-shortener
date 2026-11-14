@@ -1,1 +1,17 @@
+node_modules/
+dist/
+coverage/
+
+# Entorno local (nunca commitear secretos)
+.env
+.env.*
+!.env.example
+
+# Base de datos SQLite local (Fase 1)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Notas del plan
 **/*.md
