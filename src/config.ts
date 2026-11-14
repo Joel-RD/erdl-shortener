@@ -55,6 +55,12 @@ const envSchema = z.object({
       typeof value === 'string' && value.trim() === '' ? undefined : value,
     z.string().min(1, 'DATABASE_AUTH_TOKEN no puede estar vacío').optional(),
   ),
+  // Visible en el pie de todas las páginas para reportar abuso.
+  ABUSE_CONTACT_EMAIL: z.preprocess(
+    (value) =>
+      typeof value === 'string' && value.trim() === '' ? undefined : value,
+    z.string().trim().email('ABUSE_CONTACT_EMAIL no es un correo válido').optional(),
+  ),
 });
 
 export type Config = {
@@ -67,6 +73,7 @@ export type Config = {
   trustProxy: number;
   databaseUrl: string;
   databaseAuthToken: string | undefined;
+  abuseContactEmail: string | undefined;
 };
 
 export function parseConfig(
@@ -94,6 +101,7 @@ export function parseConfig(
     trustProxy: data.TRUST_PROXY,
     databaseUrl: data.DATABASE_URL,
     databaseAuthToken: data.DATABASE_AUTH_TOKEN,
+    abuseContactEmail: data.ABUSE_CONTACT_EMAIL,
   };
 }
 

@@ -1,13 +1,56 @@
+import { fileURLToPath } from 'node:url';
 import express, { type ErrorRequestHandler } from 'express';
+import helmet from 'helmet';
 import { pinoHttp } from 'pino-http';
 import { config } from './config.js';
+import { db as defaultDb, type DatabaseClient } from './db/client.js';
+import { createLinkService } from './links/service.js';
+import { createApiLinksRouter } from './routes/api-links.js';
+import { createPagesRouter } from './routes/pages.js';
+import { createRedirectRouter } from './routes/redirect.js';
+import { wantsHtml } from './routes/shared.js';
+import { renderErrorPage } from './ui/pages.js';
 import { logger } from './logger.js';
 
-export function createApp(): express.Express {
+export type AppOptions = {
+  db?: DatabaseClient | undefined;
+  now?: (() => Date) | undefined;
+  abuseContactEmail?: string | undefined;
+};
+
+const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
+
+export function createApp(options: AppOptions = {}): express.Express {
   const app = express();
+  const db = options.db ?? defaultDb;
+  const abuseContactEmail =
+    options.abuseContactEmail ?? config.abuseContactEmail;
+  const service = createLinkService({ db, now: options.now });
 
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy === 0 ? false : config.trustProxy);
+
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          baseUri: ["'self'"],
+          connectSrc: ["'self'"],
+          fontSrc: ["'self'"],
+          formAction: ["'self'"],
+          frameAncestors: ["'none'"],
+          imgSrc: ["'self'", 'data:'],
+          objectSrc: ["'none'"],
+          scriptSrc: ["'self'"],
+          styleSrc: ["'self'"],
+          upgradeInsecureRequests: null,
+        },
+      },
+      referrerPolicy: { policy: 'no-referrer' },
+      xFrameOptions: { action: 'deny' },
+    }),
+  );
 
   app.use(
     pinoHttp({
@@ -25,19 +68,92 @@ export function createApp(): express.Express {
     res.status(200).json({ status: 'ok' });
   });
 
-  app.use((_req, res) => {
+  app.use(
+    express.static(PUBLIC_DIR, {
+      index: false,
+      etag: true,
+      maxAge: config.isProduction ? '1h' : 0,
+    }),
+  );
+
+  app.use(
+    '/api/v1',
+    createApiLinksRouter({ service, baseUrl: config.baseUrl }),
+  );
+  app.use(
+    createPagesRouter({ service, baseUrl: config.baseUrl, abuseContactEmail }),
+  );
+  app.use(createRedirectRouter({ service, abuseContactEmail }));
+
+  app.use((req, res) => {
+    if (wantsHtml(req) && !req.path.startsWith('/api/')) {
+      res
+        .status(404)
+        .set('Cache-Control', 'no-store')
+        .type('html')
+        .send(
+          renderErrorPage({
+            status: 404,
+            title: 'Página no encontrada',
+            message: 'La ruta que buscas no existe en este servidor.',
+            abuseContactEmail,
+          }),
+        );
+      return;
+    }
+
     res.status(404).json({ error: 'not_found' });
   });
 
   const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
-    req.log.error({ err }, 'unhandled_error');
+    const rawStatus =
+      typeof err === 'object' && err !== null && 'status' in err
+        ? Number((err as { status?: unknown }).status)
+        : Number.NaN;
+
+    const status =
+      Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus < 500
+        ? rawStatus
+        : 500;
+
+    if (status >= 500) {
+      req.log.error({ err }, 'unhandled_error');
+    } else {
+      req.log.warn({ err, status }, 'request_error');
+    }
 
     if (res.headersSent) {
       next(err);
       return;
     }
 
-    res.status(500).json({ error: 'internal_error' });
+    if (wantsHtml(req) && !req.path.startsWith('/api/')) {
+      res
+        .status(status)
+        .set('Cache-Control', 'no-store')
+        .type('html')
+        .send(
+          renderErrorPage({
+            status,
+            title: status === 500 ? 'Algo salió mal' : 'Petición no válida',
+            message:
+              status === 500
+                ? 'Tuvimos un problema al procesar la petición. Inténtalo de nuevo.'
+                : 'La petición no se pudo procesar tal como llegó.',
+            abuseContactEmail,
+          }),
+        );
+      return;
+    }
+
+    res.status(status).json({
+      error:
+        status === 413
+          ? 'payload_too_large'
+          : status === 400
+            ? 'bad_request'
+            : 'internal_error',
+    });
   };
 
   app.use(errorHandler);

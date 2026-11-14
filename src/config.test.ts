@@ -24,6 +24,23 @@ describe('parseConfig', () => {
     expect(parsed.databaseAuthToken).toBeUndefined();
   });
 
+  it('acepta y normaliza el correo de abuso; vacío significa desactivado', () => {
+    const configured = parseConfig({
+      ...validEnv,
+      ABUSE_CONTACT_EMAIL: ' abuso@example.com ',
+    });
+    const disabled = parseConfig({ ...validEnv, ABUSE_CONTACT_EMAIL: '  ' });
+
+    expect(configured.abuseContactEmail).toBe('abuso@example.com');
+    expect(disabled.abuseContactEmail).toBeUndefined();
+  });
+
+  it('rechaza un correo de abuso inválido', () => {
+    expect(() =>
+      parseConfig({ ...validEnv, ABUSE_CONTACT_EMAIL: 'no-es-un-correo' }),
+    ).toThrow(/ABUSE_CONTACT_EMAIL/);
+  });
+
   it('rechaza DATABASE_URL con un protocolo no soportado', () => {
     expect(() =>
       parseConfig({ ...validEnv, DATABASE_URL: 'postgres://localhost/erdl' }),
