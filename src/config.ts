@@ -15,6 +15,21 @@ const logLevels = [
   'silent',
 ] as const;
 
+const databaseUrlSchema = z
+  .string()
+  .trim()
+  .min(1, 'DATABASE_URL no puede estar vacía')
+  .refine((value) => {
+    try {
+      const { protocol } = new URL(value);
+      return ['file:', 'libsql:', 'http:', 'https:', 'ws:', 'wss:'].includes(
+        protocol,
+      );
+    } catch {
+      return false;
+    }
+  }, 'DATABASE_URL debe usar file:, libsql:, http(s): o ws(s):');
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
@@ -32,6 +47,14 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(logLevels).default('info'),
   // 0 = sin proxy (local). En Render debe ser 1.
   TRUST_PROXY: z.coerce.number().int().min(0).max(10).default(0),
+  // Dev/tests: file:local.db (SQLite con WAL). Prod: libsql://... (Turso).
+  DATABASE_URL: databaseUrlSchema.default('file:local.db'),
+  // Turso lo exige; en local va vacío y se normaliza a undefined.
+  DATABASE_AUTH_TOKEN: z.preprocess(
+    (value) =>
+      typeof value === 'string' && value.trim() === '' ? undefined : value,
+    z.string().min(1, 'DATABASE_AUTH_TOKEN no puede estar vacío').optional(),
+  ),
 });
 
 export type Config = {
@@ -42,6 +65,8 @@ export type Config = {
   adminToken: string;
   logLevel: (typeof logLevels)[number];
   trustProxy: number;
+  databaseUrl: string;
+  databaseAuthToken: string | undefined;
 };
 
 export function parseConfig(
@@ -67,6 +92,8 @@ export function parseConfig(
     adminToken: data.ADMIN_TOKEN,
     logLevel: data.LOG_LEVEL,
     trustProxy: data.TRUST_PROXY,
+    databaseUrl: data.DATABASE_URL,
+    databaseAuthToken: data.DATABASE_AUTH_TOKEN,
   };
 }
 

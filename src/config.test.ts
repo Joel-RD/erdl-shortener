@@ -14,6 +14,20 @@ describe('parseConfig', () => {
     expect(parsed.port).toBe(3000);
     expect(parsed.trustProxy).toBe(0);
     expect(parsed.logLevel).toBe('info');
+    expect(parsed.databaseUrl).toBe('file:local.db');
+    expect(parsed.databaseAuthToken).toBeUndefined();
+  });
+
+  it('normaliza DATABASE_AUTH_TOKEN vacío a undefined', () => {
+    const parsed = parseConfig({ ...validEnv, DATABASE_AUTH_TOKEN: '  ' });
+
+    expect(parsed.databaseAuthToken).toBeUndefined();
+  });
+
+  it('rechaza DATABASE_URL con un protocolo no soportado', () => {
+    expect(() =>
+      parseConfig({ ...validEnv, DATABASE_URL: 'postgres://localhost/erdl' }),
+    ).toThrow(/DATABASE_URL/);
   });
 
   it('falla si ADMIN_TOKEN no está definido', () => {
