@@ -3,8 +3,13 @@
 -- Fechas: TEXT ISO-8601 en UTC con milisegundos
 -- ('2026-11-13T22:47:56.123Z'). Ese formato se ordena lexicográficamente
 -- igual que el tiempo, así que sirve para comparar en SQL sin conversiones.
+--
+-- DDL idempotente (IF NOT EXISTS): una DB restaurada desde un dump, o un
+-- intento anterior que dejó el esquema creado sin registrar la migración,
+-- debe poder arrancar en vez de entrar en un bucle de "already exists".
+-- Si el esquema preexistente difiere, hay que recrear la DB (ver README).
 
-CREATE TABLE links (
+CREATE TABLE IF NOT EXISTS links (
   -- El alias es la clave natural: al quedar deshabilitado en vez de borrarse,
   -- el alias nunca puede reutilizarse.
   alias TEXT PRIMARY KEY,
@@ -30,24 +35,24 @@ CREATE TABLE links (
 );
 
 -- Dedupe: misma URL + misma IP en las últimas 24 h devuelve el alias existente.
-CREATE INDEX idx_links_dedupe
+CREATE INDEX IF NOT EXISTS idx_links_dedupe
   ON links (url_hash, created_ip_hash, created_at);
 
 -- Cuota: contar enlaces activos de una IP. Parcial porque tras la retención
 -- las filas con created_ip_hash NULL ya no cuentan.
-CREATE INDEX idx_links_created_ip_hash
+CREATE INDEX IF NOT EXISTS idx_links_created_ip_hash
   ON links (created_ip_hash)
   WHERE created_ip_hash IS NOT NULL;
 
 -- Blocklist/estadísticas: agregar o buscar por dominio.
-CREATE INDEX idx_links_domain ON links (domain);
+CREATE INDEX IF NOT EXISTS idx_links_domain ON links (domain);
 
 -- Limpieza de vencidos: solo interesan las filas que tienen expiración.
-CREATE INDEX idx_links_expires_at
+CREATE INDEX IF NOT EXISTS idx_links_expires_at
   ON links (expires_at)
   WHERE expires_at IS NOT NULL;
 
-CREATE TABLE blocked_domains (
+CREATE TABLE IF NOT EXISTS blocked_domains (
   -- Un dominio registrable por fila; NOCASE evita duplicar Example.com.
   domain TEXT PRIMARY KEY COLLATE NOCASE,
   -- 'seed' = JSON versionado en el repo; 'manual' = alta desde el endpoint admin.

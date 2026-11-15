@@ -10,6 +10,10 @@ services:
     # NODE_ENV=production hace que npm ci omita devDependencies, y el build
     # necesita TypeScript. Forzar dev deps solo en la fase de build.
     buildCommand: npm ci --include=dev && npm run build
+    # Las migraciones corren antes de levantar la instancia nueva. Si fallan,
+    # el deploy se marca fallido pero la instancia anterior sigue sirviendo:
+    # evita el bucle de reinicios que dejaría el servicio caído.
+    preDeployCommand: npm run db:migrate
     startCommand: npm start
     healthCheckPath: /ready
     autoDeploy: true

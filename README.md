@@ -55,11 +55,13 @@ curl -i http://localhost:3000/<alias>
 ## Scripts
 
 ```bash
-npm run dev        # tsx watch
-npm run build      # tsc a dist/
-npm start          # node dist/server.js
-npm run typecheck  # tsc --noEmit
-npm test           # Vitest (175+ tests)
+npm run dev          # tsx watch
+npm run build        # tsc a dist/
+npm start            # node dist/server.js
+npm run db:migrate   # aplica migraciones pendientes (requiere build)
+npm run db:baseline  # registra migraciones cuyo esquema ya existe
+npm run typecheck    # tsc --noEmit
+npm test             # Vitest (191 tests)
 npm run test:watch
 ```
 
@@ -211,6 +213,49 @@ retira con `DELETE /api/v1/links/:alias`.
 
 El build usa `npm ci --include=dev` porque `NODE_ENV=production` haría que npm
 omitiera TypeScript y `npm run build` fallaría.
+
+`preDeployCommand: npm run db:migrate` aplica las migraciones antes de levantar
+la instancia nueva. Si una migración falla, Render marca el deploy como fallido
+pero **la instancia anterior sigue sirviendo**. El arranque también las ejecuta
+como red de seguridad: ahí un fallo sí tumba el proceso (fail-fast, no se sirve
+tráfico con el esquema incompleto).
+
+### Migraciones y recuperación
+
+Las migraciones son idempotentes (`CREATE TABLE/INDEX IF NOT EXISTS`): una DB
+con el esquema ya creado pero `schema_migrations` vacío —un dump restaurado, una
+DB creada a mano o un intento anterior interrumpido— arranca igualmente y el
+registro se completa en la primera ejecución.
+
+Si el esquema preexistente **no coincide** con las migraciones, `IF NOT EXISTS`
+no lo detecta. Para revisarlo con Turso CLI:
+
+```bash
+turso db shell <db> "SELECT name FROM schema_migrations;"
+turso db shell <db> "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%';"
+```
+
+Y para registrar lo que ya existe sin volver a ejecutar SQL (con `--dry-run`
+primero, que solo informa):
+
+```bash
+npm run build
+DATABASE_URL=libsql://… DATABASE_AUTH_TOKEN=… npm run db:baseline -- --dry-run
+DATABASE_URL=libsql://… DATABASE_AUTH_TOKEN=… npm run db:baseline
+```
+
+Los comandos usan las mismas variables que la app (en local basta con tener
+`.env`; en Render ya están todas definidas).
+
+`db:baseline` solo registra una migración si **todos** sus objetos existen y
+sale con código 1 si alguna queda pendiente (esquema incompleto o no
+reconocible). Si no hay datos que conservar, lo más simple es recrear la DB
+(`turso db create`) y actualizar `DATABASE_URL` y `DATABASE_AUTH_TOKEN` en
+Render.
+
+Si el deploy falla con `table … already exists` y `schema_migrations` está
+vacía, es exactamente este caso: baseline o recrear. El error de arranque ahora
+incluye esa pista.
 
 El plan `free` de Render duerme la instancia; este MVP asume **una sola
 instancia always-on** porque caché, rate limiter y buffer de clics viven en
