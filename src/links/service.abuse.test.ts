@@ -27,14 +27,34 @@ async function setup(
 
   let selects = 0;
   const client = database.client;
+
+  function countStatement(statement: InStatement | string): void {
+    const sql = typeof statement === 'string' ? statement : statement.sql;
+
+    if (/\bFROM\s+links\b/i.test(sql)) selects += 1;
+  }
+
   const countingClient = {
     execute: (statement: InStatement | string) => {
-      const sql =
-        typeof statement === 'string' ? statement : statement.sql;
-
-      if (/\bFROM\s+links\b/i.test(sql)) selects += 1;
-
+      countStatement(statement);
       return client.execute(statement);
+    },
+    transaction: async (mode: 'write' | 'read' | 'deferred') => {
+      const transaction = await client.transaction(mode);
+
+      // El servicio crea dentro de una transacción; sus SELECT también deben
+      // contar para las aserciones de caché/lecturas.
+      return {
+        execute: (statement: InStatement) => {
+          countStatement(statement);
+          return transaction.execute(statement);
+        },
+        batch: transaction.batch.bind(transaction),
+        executeMultiple: transaction.executeMultiple.bind(transaction),
+        commit: transaction.commit.bind(transaction),
+        rollback: transaction.rollback.bind(transaction),
+        close: transaction.close.bind(transaction),
+      };
     },
   } as unknown as Client;
 

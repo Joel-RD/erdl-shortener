@@ -56,6 +56,10 @@ describe('validateUrl', () => {
     ['http://foo.localhost/', 'url_local'],
     ['http://intranet/', 'url_local'],
     ['http://impresora.local/', 'url_local'],
+    ['http://home.arpa/', 'url_local'],
+    ['http://router.home.arpa/', 'url_local'],
+    ['http://servidor.lan/', 'url_local'],
+    ['http://nas.corp/', 'url_local'],
     ['http://127.0.0.1/', 'url_private_ip'],
     ['http://127.1/', 'url_private_ip'],
     ['http://2130706433/', 'url_private_ip'],
@@ -71,6 +75,11 @@ describe('validateUrl', () => {
     ['http://[fe80::1]/', 'url_private_ip'],
     ['http://[::ffff:127.0.0.1]/', 'url_private_ip'],
     ['http://[64:ff9b::7f00:1]/', 'url_private_ip'],
+    ['http://[2001:0:1::1]/', 'url_private_ip'],
+    ['http://[fec0::1]/', 'url_private_ip'],
+    ['http://[100::1]/', 'url_private_ip'],
+    ['http://[64:ff9b:1::1]/', 'url_private_ip'],
+    ['http://[::ffff:0:7f00:1]/', 'url_private_ip'],
     [`https://example.com/${'a'.repeat(MAX_URL_LENGTH)}`, 'url_too_long'],
   ];
 

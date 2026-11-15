@@ -47,6 +47,21 @@ describe('form-token', () => {
     expect(verifyFormToken(SECRET, token, { now: NOW })).toBe('malformed');
   });
 
+  it('rechaza un token firmado para otra IP', () => {
+    const token = createFormToken(
+      SECRET,
+      new Date(NOW.getTime() - 10_000),
+      'ip-hash-a',
+    );
+
+    expect(
+      verifyFormToken(SECRET, token, { now: NOW, context: 'ip-hash-b' }),
+    ).toBe('malformed');
+    expect(
+      verifyFormToken(SECRET, token, { now: NOW, context: 'ip-hash-a' }),
+    ).toBe('valid');
+  });
+
   it('rechaza envíos demasiado rápidos, futuros o vencidos', () => {
     expect(
       verifyFormToken(SECRET, tokenAged(500), { now: NOW }),

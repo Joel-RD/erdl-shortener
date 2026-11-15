@@ -62,6 +62,11 @@ describe('normalizeBlocklistDomain', () => {
     expect(normalizeBlocklistDomain('[::1]')).toBeNull();
     expect(normalizeBlocklistDomain('localhost')).toBeNull();
     expect(normalizeBlocklistDomain('')).toBeNull();
+    // Un sufijo público bloquearía medio Internet.
+    expect(normalizeBlocklistDomain('com')).toBeNull();
+    expect(normalizeBlocklistDomain('co.uk')).toBeNull();
+    // Los dominios privados siguen siendo registrables.
+    expect(normalizeBlocklistDomain('github.io')).toBe('github.io');
   });
 });
 

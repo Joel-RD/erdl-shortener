@@ -29,10 +29,17 @@ export type AliasCacheStats = {
 
 export type AliasCache = {
   get(alias: string, at?: Date): ResolvedLink | undefined;
-  set(link: ResolvedLink, at?: Date): void;
+  /**
+   * `expectedGeneration` evita repoblar con una lectura que empezó antes de
+   * una invalidación (takedown). El servicio captura `generation` antes de ir
+   * a la DB y lo pasa aquí.
+   */
+  set(link: ResolvedLink, at?: Date, expectedGeneration?: number): void;
   delete(alias: string): void;
   clear(): void;
   readonly size: number;
+  /** Sube con cada delete/clear; sirve para descartar lecturas obsoletas. */
+  readonly generation: number;
   readonly stats: Readonly<AliasCacheStats>;
 };
 
@@ -48,6 +55,7 @@ export function createAliasCache(options: AliasCacheOptions = {}): AliasCache {
 
   const entries = new Map<string, CacheEntry>();
   const stats: AliasCacheStats = { hits: 0, misses: 0, evictions: 0 };
+  let generation = 0;
 
   function evictIfNeeded(): void {
     while (entries.size > maxEntries) {
@@ -86,7 +94,16 @@ export function createAliasCache(options: AliasCacheOptions = {}): AliasCache {
       return entry.link;
     },
 
-    set(link, at) {
+    set(link, at, expectedGeneration) {
+      // La lectura que originó este set es anterior a una invalidación: no
+      // debe resucitar un enlace que acaba de ser retirado.
+      if (
+        expectedGeneration !== undefined &&
+        expectedGeneration !== generation
+      ) {
+        return;
+      }
+
       const storedAtMs = (at ?? now()).getTime();
 
       entries.delete(link.alias);
@@ -95,15 +112,21 @@ export function createAliasCache(options: AliasCacheOptions = {}): AliasCache {
     },
 
     delete(alias) {
+      generation += 1;
       entries.delete(alias);
     },
 
     clear() {
+      generation += 1;
       entries.clear();
     },
 
     get size() {
       return entries.size;
+    },
+
+    get generation() {
+      return generation;
     },
 
     get stats() {

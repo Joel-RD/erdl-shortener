@@ -51,9 +51,23 @@ export const DEFAULT_CREATE_IP_RULES: readonly RateLimitRule[] = [
   { name: 'day', limit: 100, windowMs: 86_400_000 },
 ];
 
-/** Freno global para que muchas IPs no inunden la única instancia. */
+/**
+ * Freno global para que muchas IPs no inunden la única instancia. Se mide en
+ * creaciones *intentadas tras validar*: 2000/h cubre un pico de tráfico real
+ * sin dejar la instancia (una sola, always-on) sin margen.
+ */
 export const DEFAULT_CREATE_GLOBAL_RULES: readonly RateLimitRule[] = [
-  { name: 'global-hour', limit: 500, windowMs: 3_600_000 },
+  { name: 'global-hour', limit: 2_000, windowMs: 3_600_000 },
+];
+
+/**
+ * Freno general para peticiones mutantes (POST/PUT/PATCH/DELETE), aplicado
+ * antes de parsear el cuerpo. 120/min por IP deja sitio a formularios y API
+ * humanos, pero corta un flood de cuerpos grandes antes de que consuman JSON
+ * parser, validación o DB.
+ */
+export const DEFAULT_REQUEST_IP_RULES: readonly RateLimitRule[] = [
+  { name: 'minute', limit: 120, windowMs: 60_000 },
 ];
 
 /**
@@ -112,16 +126,20 @@ export function createMemoryRateLimiter(
       let bucket = buckets.get(key);
 
       if (!bucket || currentMs >= bucket.resetAtMs) {
-        // Reinsertar mueve la ventana al final del Map: la evicción aproximada
-        // castiga primero las claves que llevan más tiempo sin reiniciarse.
         buckets.delete(key);
         bucket = {
           count: 0,
           resetAtMs: currentMs + rule.windowMs,
         };
-        buckets.set(key, bucket);
-        evictIfNeeded();
+      } else {
+        // Reinsertar en cada consumo mantiene un LRU real: la evicción por
+        // tamaño castiga la clave que lleva más tiempo sin actividad, no solo
+        // la que no ha reiniciado su ventana.
+        buckets.delete(key);
       }
+
+      buckets.set(key, bucket);
+      evictIfNeeded();
 
       if (bucket.count >= rule.limit) {
         return {

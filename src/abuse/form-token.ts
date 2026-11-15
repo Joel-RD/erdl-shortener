@@ -17,8 +17,8 @@ export const FORM_HONEYPOT_FIELD = 'website';
 /** Un humano tarda al menos esto en pegar una URL y pulsar el botón. */
 export const DEFAULT_FORM_MIN_AGE_MS = 3_000;
 
-/** Un formulario abierto más de dos horas probablemente sea un replay. */
-export const DEFAULT_FORM_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+/** Un formulario abierto más de 30 min probablemente sea un replay. */
+export const DEFAULT_FORM_MAX_AGE_MS = 30 * 60 * 1000;
 
 export type FormTokenStatus =
   | 'valid'
@@ -31,11 +31,17 @@ export type VerifyFormTokenOptions = {
   now?: Date | undefined;
   minAgeMs?: number | undefined;
   maxAgeMs?: number | undefined;
+  /**
+   * Contexto ligado al token (el HMAC de la IP). Impide que un token robado a
+   * otra conexión se reutilice desde una IP distinta.
+   */
+  context?: string | undefined;
 };
 
-function sign(secret: string, timestamp: string): string {
+function sign(secret: string, timestamp: string, context: string): string {
   return createHmac('sha256', secret)
-    .update(`form-token:v1:${timestamp}`)
+    // El prefijo de longitud evita ambigüedades si el contexto contiene `:`.
+    .update(`form-token:v2:${context.length}:${context}:${timestamp}`)
     .digest('hex');
 }
 
@@ -52,10 +58,11 @@ function signaturesMatch(left: string, right: string): boolean {
 export function createFormToken(
   secret: string,
   at: Date = new Date(),
+  context = '',
 ): string {
   const timestamp = String(at.getTime());
 
-  return `${timestamp}.${sign(secret, timestamp)}`;
+  return `${timestamp}.${sign(secret, timestamp, context)}`;
 }
 
 export function verifyFormToken(
@@ -71,8 +78,9 @@ export function verifyFormToken(
 
   const timestamp = match[1] ?? '';
   const signature = match[2] ?? '';
+  const context = options.context ?? '';
 
-  if (!signaturesMatch(signature, sign(secret, timestamp))) {
+  if (!signaturesMatch(signature, sign(secret, timestamp, context))) {
     return 'malformed';
   }
 

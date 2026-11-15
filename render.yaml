@@ -7,9 +7,11 @@ services:
     name: erdl-shortener
     runtime: node
     plan: starter
-    buildCommand: npm ci && npm run build
+    # NODE_ENV=production hace que npm ci omita devDependencies, y el build
+    # necesita TypeScript. Forzar dev deps solo en la fase de build.
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start
-    healthCheckPath: /health
+    healthCheckPath: /ready
     autoDeploy: true
     envVars:
       - key: NODE_ENV

@@ -54,6 +54,19 @@ export function enforceRedirectRateLimits(
   return consumeRules(limiter, `redirect:ip:${ipHash}`, rules, nowMs);
 }
 
+/**
+ * Peticiones mutantes antes de parsear el cuerpo. Es un freno grueso: los
+ * límites finos (creación, redirect, lookup) se siguen aplicando en su ruta.
+ */
+export function enforceRequestRateLimits(
+  limiter: RateLimiter,
+  ipHash: string,
+  rules: readonly RateLimitRule[],
+  nowMs: number,
+): RateLimitRejection | null {
+  return consumeRules(limiter, `request:ip:${ipHash}`, rules, nowMs);
+}
+
 export function enforceLookupRateLimits(
   limiter: RateLimiter,
   ipHash: string,

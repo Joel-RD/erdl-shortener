@@ -78,7 +78,12 @@ export function normalizeBlocklistDomain(raw: string): string | null {
 
   if (ascii === '' || !ascii.includes('.')) return null;
 
-  return (getDomain(ascii, { allowPrivateDomains: false }) ?? ascii).toLowerCase();
+  // `getDomain` devuelve null para un sufijo público (`com`, `co.uk`): darlo
+  // de alta bloquearía medio Internet. Los dominios privados (`github.io`)
+  // siguen siendo válidos con `allowPrivateDomains: false`.
+  const registrable = getDomain(ascii, { allowPrivateDomains: false });
+
+  return registrable === null ? null : registrable.toLowerCase();
 }
 
 /**
@@ -155,7 +160,18 @@ export function createBlocklist({
       return cached;
     }
 
-    if (inFlight !== null) return inFlight;
+    if (inFlight !== null) {
+      // Si el alta manual invalidó la caché mientras la consulta estaba en
+      // vuelo, la promesa compartida trae datos viejos. Esperar y volver a
+      // evaluar evita devolver una blocklist obsoleta al llamante.
+      await inFlight;
+
+      if (cached !== null && currentMs - loadedAtMs < cacheTtlMs) {
+        return cached;
+      }
+
+      return load(currentMs);
+    }
 
     const startedGeneration = generation;
 

@@ -9,6 +9,7 @@ import {
   FORM_HONEYPOT_FIELD,
   FORM_TOKEN_FIELD,
 } from './abuse/form-token.js';
+import { hashIp } from './abuse/ip.js';
 import { createApp, getAppRuntime, type AppRuntime } from './app.js';
 import { config } from './config.js';
 import { createLogger } from './logger.js';
@@ -23,8 +24,16 @@ const UNLIMITED = [
   { name: 'test', limit: 1_000_000, windowMs: 60_000 },
 ] as const;
 
+// supertest conecta desde loopback; el token del formulario va ligado a ese
+// HMAC igual que en producción.
+const TEST_IP_HASH = hashIp(config.ipHashSecret, '127.0.0.1');
+
 function formToken(ageMs = 0): string {
-  return createFormToken(FORM_SECRET, new Date(Date.now() - ageMs));
+  return createFormToken(
+    FORM_SECRET,
+    new Date(Date.now() - ageMs),
+    TEST_IP_HASH,
+  );
 }
 
 function formBody(
@@ -57,6 +66,7 @@ beforeAll(async () => {
       createIp: UNLIMITED,
       createGlobal: [],
       redirectIp: [],
+      requestIp: UNLIMITED,
     },
     clickBuffer: createClickBuffer({ db, intervalMs: 60_000 }),
   });
@@ -82,6 +92,13 @@ describe('GET /health', () => {
 
     expect(response.headers['x-powered-by']).toBeUndefined();
   });
+
+  it('GET /ready comprueba la base de datos', async () => {
+    const response = await request(app).get('/ready');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ status: 'ready' });
+  });
 });
 
 describe('cabeceras de seguridad', () => {
@@ -95,6 +112,8 @@ describe('cabeceras de seguridad', () => {
     expect(csp).not.toContain('unsafe-inline');
     expect(response.headers['x-frame-options']).toBe('DENY');
     expect(response.headers['referrer-policy']).toBe('no-referrer');
+    // HSTS solo se activa en producción (HTTPS).
+    expect(response.headers['strict-transport-security']).toBeUndefined();
   });
 
   it('sirve los estáticos con su tipo correcto', async () => {
@@ -345,6 +364,7 @@ describe('abuso y rendimiento', () => {
         createIp: [{ name: 'minute', limit: 5, windowMs: 60_000 }],
         createGlobal: [],
         redirectIp: [],
+        requestIp: UNLIMITED,
       },
     });
     const limitedRuntime = getAppRuntime(limitedApp);
@@ -674,6 +694,7 @@ describe('abuso II: blocklist, honeypot y administración', () => {
         createIp: UNLIMITED,
         createGlobal: [],
         redirectIp: [],
+        requestIp: UNLIMITED,
       },
     });
     const strictRuntime = getAppRuntime(strictApp);
@@ -740,12 +761,19 @@ describe('regresiones de la revisión de código', () => {
     const logged = createApp({
       db: database.client,
       logger: createLogger({ level: 'info', destination: sink }),
-      limits: { createIp: UNLIMITED, createGlobal: [], redirectIp: [] },
+      limits: {
+        createIp: UNLIMITED,
+        createGlobal: [],
+        redirectIp: [],
+        requestIp: UNLIMITED,
+      },
     });
 
     try {
       await request(logged)
         .post('/api/v1/links')
+        .set('X-Forwarded-For', '203.0.113.77')
+        .set('Referer', 'https://privado.example/ruta')
         .send({ url: 'https://example.com/sin-ip-en-logs' });
 
       expect(output).toContain('"method":"POST"');
@@ -753,9 +781,168 @@ describe('regresiones de la revisión de código', () => {
       expect(output).not.toContain('remotePort');
       expect(output).not.toContain('127.0.0.1"');
       expect(output).not.toContain('::ffff:127.0.0.1');
+      expect(output).not.toContain('203.0.113.77');
+      expect(output).not.toContain('privado.example');
     } finally {
       await getAppRuntime(logged).close();
       await database.cleanup();
+    }
+  });
+
+  it('la API rechaza formularios urlencoded con 415 y no crea nada', async () => {
+    const response = await request(app)
+      .post('/api/v1/links')
+      .type('form')
+      .send({ url: 'https://example.com/urlencoded' });
+
+    expect(response.status).toBe(415);
+    expect(response.body.error).toBe('unsupported_media_type');
+    expect(response.headers['cache-control']).toBe('no-store');
+  });
+
+  it('un cuerpo inválido no consume la cuota de creación', async () => {
+    const quotaDatabase = await createTempDatabase();
+    const quotaApp = createApp({
+      db: quotaDatabase.client,
+      limits: {
+        createIp: [{ name: 'minute', limit: 1, windowMs: 60_000 }],
+        createGlobal: [],
+        redirectIp: [],
+        requestIp: UNLIMITED,
+      },
+    });
+    const quotaRuntime = getAppRuntime(quotaApp);
+
+    try {
+      // Zod falla (campo desconocido) antes de tocar el limitador.
+      const invalid = await request(quotaApp)
+        .post('/api/v1/links')
+        .send({ url: 'https://example.com/cuota-invalida', admin: true });
+      const first = await request(quotaApp)
+        .post('/api/v1/links')
+        .send({ url: 'https://example.com/cuota-valida-1' });
+      const second = await request(quotaApp)
+        .post('/api/v1/links')
+        .send({ url: 'https://example.com/cuota-valida-2' });
+
+      expect(invalid.status).toBe(400);
+      expect(first.status).toBe(201);
+      expect(second.status).toBe(429);
+    } finally {
+      await quotaRuntime.close();
+      await quotaDatabase.cleanup();
+    }
+  });
+
+  it('el token del formulario está ligado al HMAC de la IP', async () => {
+    const foreignToken = createFormToken(
+      FORM_SECRET,
+      new Date(),
+      'otra-ip-distinta',
+    );
+
+    const response = await request(app)
+      .post('/links')
+      .type('form')
+      .send({
+        url: 'https://example.com/token-otra-ip',
+        [FORM_TOKEN_FIELD]: foreignToken,
+        [FORM_HONEYPOT_FIELD]: '',
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.text).toContain('No se pudo validar el formulario');
+  });
+
+  it('un HEAD no suma clics y la tarjeta creada no se indexa', async () => {
+    const created = await request(app)
+      .post('/api/v1/links')
+      .send({ url: 'https://example.com/head-sin-clic' });
+    const alias = String(created.body.alias);
+
+    const head = await request(app).head(`/${alias}`);
+    await runtime.clickBuffer.flush();
+
+    const metadata = await request(app).get(`/api/v1/links/${alias}`);
+
+    expect(head.status).toBe(302);
+    expect(metadata.body.clicks).toBe(0);
+
+    const card = await request(app)
+      .get(`/?created=${alias}`)
+      .set('Accept', 'text/html');
+
+    expect(card.headers['x-robots-tag']).toBe('noindex, nofollow');
+  });
+
+  it('frena peticiones mutantes antes de parsear el cuerpo', async () => {
+    const floodDatabase = await createTempDatabase();
+    const floodApp = createApp({
+      db: floodDatabase.client,
+      limits: {
+        createIp: UNLIMITED,
+        createGlobal: [],
+        redirectIp: [],
+        requestIp: [{ name: 'minute', limit: 2, windowMs: 60_000 }],
+      },
+    });
+    const floodRuntime = getAppRuntime(floodApp);
+
+    try {
+      const first = await request(floodApp)
+        .post('/api/v1/links')
+        .set('Content-Type', 'application/json')
+        .send('{"url":');
+      const second = await request(floodApp)
+        .post('/api/v1/links')
+        .set('Content-Type', 'application/json')
+        .send('{"url":');
+      const third = await request(floodApp)
+        .post('/api/v1/links')
+        .send({ url: 'https://example.com/flood' });
+
+      expect(first.status).toBe(400);
+      expect(second.status).toBe(400);
+      expect(third.status).toBe(429);
+      expect(third.headers['retry-after']).toMatch(/^\d+$/);
+      expect(third.headers['cache-control']).toBe('no-store');
+    } finally {
+      await floodRuntime.close();
+      await floodDatabase.cleanup();
+    }
+  });
+
+  it('la cuota agotada responde 429 con Retry-After estimado', async () => {
+    const quotaDatabase = await createTempDatabase();
+    const quotaApp = createApp({
+      db: quotaDatabase.client,
+      maxActiveLinksPerIp: 1,
+      limits: {
+        createIp: UNLIMITED,
+        createGlobal: [],
+        redirectIp: [],
+        requestIp: UNLIMITED,
+      },
+    });
+    const quotaRuntime = getAppRuntime(quotaApp);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    try {
+      const first = await request(quotaApp)
+        .post('/api/v1/links')
+        .send({ url: 'https://example.com/cuota-1', expiresAt });
+      const second = await request(quotaApp)
+        .post('/api/v1/links')
+        .send({ url: 'https://example.com/cuota-2' });
+
+      expect(first.status).toBe(201);
+      expect(second.status).toBe(429);
+      expect(second.body.error).toBe('quota_exceeded');
+      expect(Number(second.headers['retry-after'])).toBeGreaterThan(0);
+      expect(Number(second.headers['retry-after'])).toBeLessThanOrEqual(600);
+    } finally {
+      await quotaRuntime.close();
+      await quotaDatabase.cleanup();
     }
   });
 
@@ -845,6 +1032,7 @@ describe('regresiones de la revisión de código', () => {
           createGlobal: [],
           redirectIp: [],
           lookupIp: [{ name: 'test', limit: 3, windowMs: 60_000 }],
+          requestIp: UNLIMITED,
         },
       });
     });

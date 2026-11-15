@@ -40,6 +40,11 @@ export function createAdminRouter({
   const router = Router();
   const auth = requireAdminToken(adminToken);
 
+  router.use((_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
+
   router.delete('/links/:alias', auth, async (req, res) => {
     const aliasParam = req.params.alias;
     const alias = Array.isArray(aliasParam)

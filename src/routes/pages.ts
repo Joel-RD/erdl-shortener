@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import type {
   RateLimiter,
   RateLimitRule,
@@ -97,11 +97,14 @@ export function createPagesRouter({
 }: PagesRouterOptions): Router {
   const router = Router();
 
-  function formMeta(): { formToken: string; minExpiration: string } {
+  function formMeta(ipHash: string): {
+    formToken: string;
+    minExpiration: string;
+  } {
     const current = now();
 
     return {
-      formToken: createFormToken(formTokenSecret, current),
+      formToken: createFormToken(formTokenSecret, current, ipHash),
       // 6 min y no 5: el mínimo del servicio se evalúa al recibir el POST,
       // así que el borde exacto de 5 min podría rechazarse por latencia.
       minExpiration: formatDatetimeLocalUtc(
@@ -112,13 +115,20 @@ export function createPagesRouter({
 
   router.get('/', async (req, res) => {
     const requestedAlias = firstQueryValue(req.query.created);
+    const ipHash = getClientIpHash(req, ipHashSecret);
     let created: CreatedLinkView | null = null;
+
+    // La tarjeta de "enlace creado" no debe indexarse: contiene un alias que
+    // solo debe ver quien acaba de crearlo (aunque cualquiera pueda adivinarlo).
+    if (requestedAlias !== null) {
+      res.set('X-Robots-Tag', 'noindex, nofollow');
+    }
 
     if (requestedAlias && CUSTOM_ALIAS_PATTERN.test(requestedAlias)) {
       // Solo la consulta con alias toca la DB; la portada sola no se limita.
       const limited = enforceLookupRateLimits(
         rateLimiter,
-        getClientIpHash(req, ipHashSecret),
+        ipHash,
         lookupIpRules,
         now().getTime(),
       );
@@ -134,7 +144,7 @@ export function createPagesRouter({
               errorMessage:
                 'Demasiadas consultas desde tu conexión. Espera un momento y vuelve a intentarlo.',
               abuseContactEmail,
-              ...formMeta(),
+              ...formMeta(ipHash),
             }),
           );
         return;
@@ -161,130 +171,146 @@ export function createPagesRouter({
         renderHomePage({
           created,
           abuseContactEmail,
-          ...formMeta(),
+          ...formMeta(ipHash),
         }),
       );
   });
 
-  router.post('/links', async (req, res) => {
-    const submittedUrl = firstBodyValue(req.body?.url);
-    const submittedAlias = firstBodyValue(req.body?.alias).trim();
-    const submittedExpiresAt = firstBodyValue(req.body?.expiresAt);
-    const ipHash = getClientIpHash(req, ipHashSecret);
-    const limited = enforceCreateRateLimits(
-      rateLimiter,
-      ipHash,
-      createIpRules,
-      createGlobalRules,
-      now().getTime(),
-    );
+  // El parser de formularios se monta SOLO en esta ruta: la API es JSON-only y
+  // el resto de la app no necesita aceptar urlencoded.
+  router.post(
+    '/links',
+    express.urlencoded({ extended: false, limit: '16kb' }),
+    async (req, res) => {
+      const ipHash = getClientIpHash(req, ipHashSecret);
+      const submittedUrl = firstBodyValue(req.body?.url);
+      const submittedAlias = firstBodyValue(req.body?.alias).trim();
+      const submittedExpiresAt = firstBodyValue(req.body?.expiresAt);
+      const honeypot = firstBodyValue(req.body?.[FORM_HONEYPOT_FIELD]).trim();
+      const formToken = req.body?.[FORM_TOKEN_FIELD];
+      const tokenStatus = verifyFormToken(formTokenSecret, formToken, {
+        now: now(),
+        minAgeMs: formTokenMinAgeMs,
+        context: ipHash,
+      });
 
-    if (limited) {
-      setRetryAfter(res, limited);
-      res
-        .status(429)
-        .set('Cache-Control', 'no-store')
-        .type('html')
-        .send(
-          renderHomePage({
-            errorMessage:
-              'Demasiadas creaciones desde tu conexión. Espera un momento y vuelve a intentarlo.',
-            submittedUrl,
-            submittedAlias,
-            submittedExpiresAt,
-            abuseContactEmail,
-            ...formMeta(),
-          }),
-        );
-      return;
-    }
+      // El campo trampa relleno o un token ausente/manipulado/de otra IP
+      // descartan el envío sin crear nada. El mensaje es genérico.
+      if (honeypot !== '' || tokenStatus !== 'valid') {
+        res
+          .status(400)
+          .set('Cache-Control', 'no-store')
+          .type('html')
+          .send(
+            renderHomePage({
+              errorMessage:
+                'No se pudo validar el formulario. Recarga la página e inténtalo de nuevo.',
+              submittedUrl,
+              submittedAlias,
+              submittedExpiresAt,
+              abuseContactEmail,
+              ...formMeta(ipHash),
+            }),
+          );
+        return;
+      }
 
-    const honeypot = firstBodyValue(req.body?.[FORM_HONEYPOT_FIELD]).trim();
-    const formToken = req.body?.[FORM_TOKEN_FIELD];
-    const tokenStatus = verifyFormToken(formTokenSecret, formToken, {
-      now: now(),
-      minAgeMs: formTokenMinAgeMs,
-    });
+      const expiration = parseFormExpiration(submittedExpiresAt);
 
-    // El campo trampa relleno o un token ausente/manipulado descartan el envío
-    // sin crear nada. El mensaje es genérico para no dar pistas al bot.
-    if (honeypot !== '' || tokenStatus !== 'valid') {
-      res
-        .status(400)
-        .set('Cache-Control', 'no-store')
-        .type('html')
-        .send(
-          renderHomePage({
-            errorMessage:
-              'No se pudo validar el formulario. Recarga la página e inténtalo de nuevo.',
-            submittedUrl,
-            submittedAlias,
-            submittedExpiresAt,
-            abuseContactEmail,
-            ...formMeta(),
-          }),
-        );
-      return;
-    }
+      if (!expiration.ok) {
+        res
+          .status(422)
+          .set('Cache-Control', 'no-store')
+          .type('html')
+          .send(
+            renderHomePage({
+              errorMessage:
+                'La fecha de caducidad no es válida. Indícala en UTC o déjala vacía.',
+              submittedUrl,
+              submittedAlias,
+              submittedExpiresAt,
+              abuseContactEmail,
+              ...formMeta(ipHash),
+            }),
+          );
+        return;
+      }
 
-    const expiration = parseFormExpiration(submittedExpiresAt);
+      // Igual que en la API: validar primero y consumir cuota después, para
+      // que un envío inválido no agote el límite de una IP legítima.
+      const limited = enforceCreateRateLimits(
+        rateLimiter,
+        ipHash,
+        createIpRules,
+        createGlobalRules,
+        now().getTime(),
+      );
 
-    if (!expiration.ok) {
-      res
-        .status(422)
-        .set('Cache-Control', 'no-store')
-        .type('html')
-        .send(
-          renderHomePage({
-            errorMessage:
-              'La fecha de caducidad no es válida. Indícala en UTC o déjala vacía.',
-            submittedUrl,
-            submittedAlias,
-            submittedExpiresAt,
-            abuseContactEmail,
-            ...formMeta(),
-          }),
-        );
-      return;
-    }
+      if (limited) {
+        setRetryAfter(res, limited);
+        res
+          .status(429)
+          .set('Cache-Control', 'no-store')
+          .type('html')
+          .send(
+            renderHomePage({
+              errorMessage:
+                'Demasiadas creaciones desde tu conexión. Espera un momento y vuelve a intentarlo.',
+              submittedUrl,
+              submittedAlias,
+              submittedExpiresAt,
+              abuseContactEmail,
+              ...formMeta(ipHash),
+            }),
+          );
+        return;
+      }
 
-    const input: CreateLinkInput = {
-      url: submittedUrl,
-      createdIpHash: ipHash,
-    };
+      const input: CreateLinkInput = {
+        url: submittedUrl,
+        createdIpHash: ipHash,
+      };
 
-    if (submittedAlias !== '') input.alias = submittedAlias;
-    if (expiration.value !== null) input.expiresAt = expiration.value;
+      if (submittedAlias !== '') input.alias = submittedAlias;
+      if (expiration.value !== null) input.expiresAt = expiration.value;
 
-    const result = await service.create(input);
+      const result = await service.create(input);
 
-    if (!result.ok) {
-      const status =
-        result.code === 'alias_taken'
-          ? 409
-          : result.code === 'quota_exceeded'
-            ? 429
-            : 422;
+      if (!result.ok) {
+        const status =
+          result.code === 'alias_taken'
+            ? 409
+            : result.code === 'quota_exceeded'
+              ? 429
+              : 422;
 
-      res
-        .status(status)
-        .set('Cache-Control', 'no-store')
-        .type('html')
-        .send(
-          renderHomePage({
-            errorMessage: result.message,
-            submittedUrl,
-            submittedAlias,
-            submittedExpiresAt,
-            abuseContactEmail,
-            ...formMeta(),
-          }),
-        );
-      return;
-    }
+        if (result.code === 'quota_exceeded') {
+          setRetryAfter(res, {
+            rule: 'quota',
+            retryAfterSeconds: result.retryAfterSeconds ?? 3_600,
+          });
+        }
 
-    res.redirect(303, `/?created=${encodeURIComponent(result.link.alias)}`);
-  });
+        res
+          .status(status)
+          .set('Cache-Control', 'no-store')
+          .type('html')
+          .send(
+            renderHomePage({
+              errorMessage: result.message,
+              submittedUrl,
+              submittedAlias,
+              submittedExpiresAt,
+              abuseContactEmail,
+              ...formMeta(ipHash),
+            }),
+          );
+        return;
+      }
+
+      res.redirect(303, `/?created=${encodeURIComponent(result.link.alias)}`);
+    },
+  );
 
   return router;
 }

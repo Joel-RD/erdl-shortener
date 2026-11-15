@@ -34,8 +34,34 @@ describe('parseConfig', () => {
       parseConfig({ ...validEnv, IP_RETENTION_DAYS: '0' }),
     ).toThrow(/IP_RETENTION_DAYS/);
     expect(() =>
+      parseConfig({ ...validEnv, IP_RETENTION_DAYS: '91' }),
+    ).toThrow(/IP_RETENTION_DAYS/);
+    expect(() =>
       parseConfig({ ...validEnv, FORM_TOKEN_SECRET: 'corto' }),
     ).toThrow(/FORM_TOKEN_SECRET/);
+  });
+
+  it('exige una DB remota en producción salvo ALLOW_LOCAL_DB', () => {
+    expect(() =>
+      parseConfig({ ...validEnv, NODE_ENV: 'production' }),
+    ).toThrow(/DATABASE_URL/);
+
+    const allowed = parseConfig({
+      ...validEnv,
+      NODE_ENV: 'production',
+      DATABASE_URL: 'file:local.db',
+      ALLOW_LOCAL_DB: 'true',
+    });
+
+    expect(allowed.allowLocalDb).toBe(true);
+
+    const remote = parseConfig({
+      ...validEnv,
+      NODE_ENV: 'production',
+      DATABASE_URL: 'libsql://erdl.turso.io',
+    });
+
+    expect(remote.databaseUrl).toBe('libsql://erdl.turso.io');
   });
 
   it('normaliza DATABASE_AUTH_TOKEN vacío a undefined', () => {

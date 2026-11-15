@@ -4,6 +4,7 @@ import type {
   RateLimitRule,
 } from '../abuse/rate-limit.js';
 import type { LinkService } from '../links/service.js';
+import { CUSTOM_ALIAS_PATTERN } from '../links/alias.js';
 import { renderErrorPage } from '../ui/pages.js';
 import {
   enforceRedirectRateLimits,
@@ -72,11 +73,38 @@ export function createRedirectRouter({
     }
 
     const alias = req.params.alias ?? '';
-    const result = await service.resolve(alias);
 
     res.set({
       'Cache-Control': 'no-store',
       'X-Robots-Tag': 'noindex, nofollow',
+    });
+
+    // Un alias imposible no toca la DB. La comprobación de patrón es barata y
+    // evita que rutas como /favicon.ico o /robots.txt lleguen a libSQL.
+    if (!CUSTOM_ALIAS_PATTERN.test(alias)) {
+      if (wantsHtml(req)) {
+        res
+          .status(404)
+          .type('html')
+          .send(
+            renderErrorPage({
+              status: 404,
+              title: 'Ese enlace no existe',
+              message:
+                'No encontramos ningún enlace con ese alias. Revisa que esté bien escrito.',
+              abuseContactEmail,
+            }),
+          );
+        return;
+      }
+
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+
+    const result = await service.resolve(alias, {
+      // Un HEAD no es una visita: no debe inflar el contador de clics.
+      recordClick: req.method !== 'HEAD',
     });
 
     if (result.ok) {

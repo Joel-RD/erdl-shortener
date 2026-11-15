@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
-import type { Client, Row } from '@libsql/client';
+import type {
+  Client,
+  InStatement,
+  ResultSet,
+  Row,
+} from '@libsql/client';
 import type { AliasCache } from '../cache/alias-cache.js';
 import type { ClickBuffer } from '../abuse/click-buffer.js';
 import type { Blocklist } from '../abuse/blocklist.js';
@@ -80,7 +85,13 @@ export type CreateLinkErrorCode =
 
 export type CreateLinkResult =
   | { ok: true; link: LinkRecord }
-  | { ok: false; code: CreateLinkErrorCode; message: string };
+  | {
+      ok: false;
+      code: CreateLinkErrorCode;
+      message: string;
+      /** Solo para `quota_exceeded`: estimación de cuándo se libera cupo. */
+      retryAfterSeconds?: number;
+    };
 
 export type ResolveResult =
   | { ok: true; link: ResolvedLink }
@@ -96,7 +107,14 @@ export type DisableResult =
 
 export type LinkService = {
   create(input: CreateLinkInput): Promise<CreateLinkResult>;
-  resolve(alias: string): Promise<ResolveResult>;
+  /**
+   * `recordClick: false` se usa en HEAD: devuelve la metadata de redirect sin
+   * contar una visita.
+   */
+  resolve(
+    alias: string,
+    options?: { recordClick?: boolean },
+  ): Promise<ResolveResult>;
   getMetadata(alias: string): Promise<LookupResult>;
   /** Takedown: marca la fila y invalida la caché sin borrar el alias. */
   disable(alias: string, reason?: string): Promise<DisableResult>;
@@ -118,6 +136,11 @@ export type LinkServiceOptions = {
   blocklist?: Pick<Blocklist, 'isBlocked'> | undefined;
   dedupeWindowMs?: number | undefined;
   maxActiveLinksPerIp?: number | undefined;
+};
+
+/** Lo que comparten `Client` y `Transaction` para ejecutar sentencias. */
+type SqlExecutor = {
+  execute(statement: InStatement): Promise<ResultSet>;
 };
 
 function hashUrl(url: string): string {
@@ -187,8 +210,11 @@ export function createLinkService({
   dedupeWindowMs = DEFAULT_DEDUPE_WINDOW_MS,
   maxActiveLinksPerIp = DEFAULT_MAX_ACTIVE_LINKS_PER_IP,
 }: LinkServiceOptions): LinkService {
-  async function findByAlias(alias: string): Promise<LinkRecord | null> {
-    const result = await db.execute({
+  async function findByAlias(
+    alias: string,
+    executor: SqlExecutor = db,
+  ): Promise<LinkRecord | null> {
+    const result = await executor.execute({
       sql: `SELECT ${SELECT_COLUMNS} FROM links WHERE alias = ? LIMIT 1`,
       args: [alias],
     });
@@ -202,12 +228,13 @@ export function createLinkService({
     createdIpHash: string,
     expiresAt: string | null,
     current: Date,
+    executor: SqlExecutor = db,
   ): Promise<LinkRecord | null> {
     const since = new Date(
       current.getTime() - dedupeWindowMs,
     ).toISOString();
 
-    const result = await db.execute({
+    const result = await executor.execute({
       sql: `SELECT ${SELECT_COLUMNS}
               FROM links
              WHERE url_hash = ?
@@ -232,9 +259,12 @@ export function createLinkService({
   async function countActiveLinks(
     createdIpHash: string,
     current: Date,
-  ): Promise<number> {
-    const result = await db.execute({
-      sql: `SELECT COUNT(*) AS total
+    executor: SqlExecutor = db,
+  ): Promise<{ total: number; nextExpiresAt: string | null }> {
+    const result = await executor.execute({
+      sql: `SELECT COUNT(*) AS total,
+                   MIN(CASE WHEN expires_at IS NOT NULL THEN expires_at END)
+                     AS next_expires_at
               FROM links
              WHERE created_ip_hash = ?
                AND disabled_at IS NULL
@@ -242,7 +272,12 @@ export function createLinkService({
       args: [createdIpHash, current.toISOString()],
     });
 
-    return Number(result.rows[0]?.total ?? 0);
+    const row = result.rows[0];
+
+    return {
+      total: Number(row?.total ?? 0),
+      nextExpiresAt: nullableString(row?.next_expires_at),
+    };
   }
 
   function validateExpiration(
@@ -334,87 +369,132 @@ export function createLinkService({
 
       const urlHash = hashUrl(validated.value.url);
       const createdIpHash = input.createdIpHash ?? null;
+      const transaction = await db.transaction('write');
 
-      if (createdIpHash !== null) {
-        // Dedupe solo para alias generados: si la persona pidió un alias
-        // concreto, ese alias manda y la colisión se resuelve aparte.
-        if (!wantsCustomAlias) {
-          const duplicate = await findRecentDuplicate(
-            urlHash,
-            createdIpHash,
-            expiration.value,
-            current,
-          );
-
-          if (duplicate) return { ok: true, link: duplicate };
-        }
-
-        const activeLinks = await countActiveLinks(createdIpHash, current);
-
-        if (activeLinks >= maxActiveLinksPerIp) {
-          return {
-            ok: false,
-            code: 'quota_exceeded',
-            message:
-              'Has alcanzado el límite de enlaces activos para tu IP. Espera a que caduquen algunos.',
-          };
-        }
-      }
-
-      let alias = validatedCustomAlias ?? generateAlias();
-      const attempts = validatedCustomAlias ? 1 : GENERATED_ALIAS_ATTEMPTS;
-
-      for (let attempt = 0; attempt < attempts; attempt += 1) {
-        try {
-          await db.execute({
-            sql: `INSERT INTO links
-                    (alias, url, url_hash, domain, created_ip_hash,
-                     created_at, expires_at)
-                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            args: [
-              alias,
-              validated.value.url,
+      try {
+        if (createdIpHash !== null) {
+          // Dedupe solo para alias generados: si la persona pidió un alias
+          // concreto, ese alias manda y la colisión se resuelve aparte.
+          if (!wantsCustomAlias) {
+            const duplicate = await findRecentDuplicate(
               urlHash,
-              validated.value.domain,
               createdIpHash,
-              current.toISOString(),
               expiration.value,
-            ],
-          });
-        } catch (error) {
-          // No dependemos del texto del error: si la fila ya existe, es una
-          // colisión de alias; si no, es un fallo real que debe propagarse.
-          const existing = await findByAlias(alias);
+              current,
+              transaction,
+            );
 
-          if (!existing) throw error;
-
-          if (validatedCustomAlias) {
-            return {
-              ok: false,
-              code: 'alias_taken',
-              message: 'Ese alias ya está en uso. Prueba con otro.',
-            };
+            if (duplicate) {
+              await transaction.commit();
+              return { ok: true, link: duplicate };
+            }
           }
 
-          alias = generateAlias();
-          continue;
+          const activeLinks = await countActiveLinks(
+            createdIpHash,
+            current,
+            transaction,
+          );
+
+          if (activeLinks.total >= maxActiveLinksPerIp) {
+            // Sin caducidades pendientes no hay un momento exacto de
+            // liberación; 1 h es una estimación conservadora.
+            const nextExpiryMs = activeLinks.nextExpiresAt
+              ? Date.parse(activeLinks.nextExpiresAt)
+              : Number.NaN;
+            const retryAfterSeconds = Number.isFinite(nextExpiryMs)
+              ? Math.max(
+                  1,
+                  Math.min(
+                    86_400,
+                    Math.ceil((nextExpiryMs - current.getTime()) / 1000),
+                  ),
+                )
+              : 3_600;
+
+            await transaction.commit();
+            return {
+              ok: false,
+              code: 'quota_exceeded',
+              message:
+                'Has alcanzado el límite de enlaces activos para tu IP. Espera a que caduquen algunos.',
+              retryAfterSeconds,
+            };
+          }
         }
 
-        const link = await findByAlias(alias);
+        let alias = validatedCustomAlias ?? generateAlias();
+        const attempts = validatedCustomAlias ? 1 : GENERATED_ALIAS_ATTEMPTS;
 
-        if (!link) {
-          throw new Error(`El enlace ${alias} se insertó pero no se pudo leer`);
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          try {
+            await transaction.execute({
+              sql: `INSERT INTO links
+                      (alias, url, url_hash, domain, created_ip_hash,
+                       created_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              args: [
+                alias,
+                validated.value.url,
+                urlHash,
+                validated.value.domain,
+                createdIpHash,
+                current.toISOString(),
+                expiration.value,
+              ],
+            });
+          } catch (error) {
+            // No dependemos del texto del error: si la fila ya existe, es una
+            // colisión de alias; si no, es un fallo real que debe propagarse.
+            const existing = await findByAlias(alias, transaction);
+
+            if (!existing) throw error;
+
+            if (validatedCustomAlias) {
+              await transaction.commit();
+              return {
+                ok: false,
+                code: 'alias_taken',
+                message: 'Ese alias ya está en uso. Prueba con otro.',
+              };
+            }
+
+            alias = generateAlias();
+            continue;
+          }
+
+          const link = await findByAlias(alias, transaction);
+
+          if (!link) {
+            throw new Error(
+              `El enlace ${alias} se insertó pero no se pudo leer`,
+            );
+          }
+
+          // Dedupe, cuota y escritura comparten transacción: dos peticiones
+          // simultáneas de la misma IP no pueden saltarse el cupo.
+          await transaction.commit();
+          return { ok: true, link };
         }
 
-        return { ok: true, link };
+        throw new Error(
+          `No se pudo generar un alias libre tras ${GENERATED_ALIAS_ATTEMPTS} intentos`,
+        );
+      } catch (error) {
+        try {
+          await transaction.rollback();
+        } catch {
+          // La transacción pudo cerrarse ya al fallar la sentencia.
+        }
+
+        throw error;
+      } finally {
+        transaction.close();
       }
-
-      throw new Error(
-        `No se pudo generar un alias libre tras ${GENERATED_ALIAS_ATTEMPTS} intentos`,
-      );
     },
 
-    async resolve(alias) {
+    async resolve(alias, options) {
+      const recordClick = options?.recordClick !== false;
       const current = now();
       const cached = cache?.get(alias, current);
 
@@ -424,18 +504,21 @@ export function createLinkService({
           return { ok: false, reason: 'gone' };
         }
 
-        clickBuffer?.record(alias, current);
+        if (recordClick) clickBuffer?.record(alias, current);
         return { ok: true, link: cached };
       }
 
+      // Generación antes de la lectura: si un takedown invalida la caché
+      // mientras la DB responde, set() descarta esta entrada obsoleta.
+      const generation = cache?.generation;
       const link = await findByAlias(alias);
 
       if (!link) return { ok: false, reason: 'not_found' };
       if (isGone(link, current)) return { ok: false, reason: 'gone' };
 
       const resolved = toResolvedLink(link);
-      cache?.set(resolved, current);
-      clickBuffer?.record(alias, current);
+      cache?.set(resolved, current, generation);
+      if (recordClick) clickBuffer?.record(alias, current);
 
       return { ok: true, link: resolved };
     },

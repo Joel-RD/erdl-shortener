@@ -77,6 +77,20 @@ describe('createAliasCache', () => {
     expect(cache.size).toBe(0);
   });
 
+  it('descarta una lectura que empezó antes de una invalidación', () => {
+    const cache = createAliasCache();
+    const at = new Date('2026-01-01T00:00:00.000Z');
+    const generation = cache.generation;
+
+    cache.set(link('obsoleto'), at, generation);
+    expect(cache.get('obsoleto', at)).toBeDefined();
+
+    cache.delete('obsoleto');
+    // La lectura concurrente ya no puede repoblar la entrada.
+    cache.set(link('obsoleto'), at, generation);
+    expect(cache.get('obsoleto', at)).toBeUndefined();
+  });
+
   it('conserva expiresAt y disabledAt en la entrada', () => {
     const cache = createAliasCache();
     const at = new Date('2026-01-01T00:00:00.000Z');

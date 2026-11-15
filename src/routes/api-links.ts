@@ -9,6 +9,7 @@ import {
   type CreateLinkInput,
   type LinkService,
 } from '../links/service.js';
+import { CUSTOM_ALIAS_PATTERN } from '../links/alias.js';
 import {
   enforceCreateRateLimits,
   enforceLookupRateLimits,
@@ -66,8 +67,31 @@ export function createApiLinksRouter({
 }: ApiLinksRouterOptions): Router {
   const router = Router();
 
+  // Metadata, errores y redirecciones de la API nunca deben cachearse: una
+  // respuesta vieja podría mostrar clics o estados ya cambiados.
+  router.use((_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
+
   router.post('/links', async (req, res) => {
     const ipHash = getClientIpHash(req, ipHashSecret);
+    const parsed = createLinkSchema.safeParse(req.body ?? {});
+
+    if (!parsed.success) {
+      res.status(400).json({
+        error: 'invalid_request',
+        message: 'El cuerpo de la petición no es válido.',
+        details: parsed.error.issues.map((issue) => ({
+          path: issue.path.join('.') || 'body',
+          message: issue.message,
+        })),
+      });
+      return;
+    }
+
+    // El límite se consume después de Zod: un cuerpo inválido no debe gastar
+    // la cuota de creación de una IP legítima.
     const limited = enforceCreateRateLimits(
       rateLimiter,
       ipHash,
@@ -82,20 +106,6 @@ export function createApiLinksRouter({
         error: 'rate_limited',
         message: 'Demasiadas creaciones. Inténtalo de nuevo más tarde.',
         retryAfter: limited.retryAfterSeconds,
-      });
-      return;
-    }
-
-    const parsed = createLinkSchema.safeParse(req.body ?? {});
-
-    if (!parsed.success) {
-      res.status(400).json({
-        error: 'invalid_request',
-        message: 'El cuerpo de la petición no es válido.',
-        details: parsed.error.issues.map((issue) => ({
-          path: issue.path.join('.') || 'body',
-          message: issue.message,
-        })),
       });
       return;
     }
@@ -119,6 +129,15 @@ export function createApiLinksRouter({
     const result = await service.create(input);
 
     if (!result.ok) {
+      if (result.code === 'quota_exceeded') {
+        // La cuota se libera cuando caducan enlaces: el servicio devuelve una
+        // estimación; si no hay caducidades, usa un valor conservador.
+        setRetryAfter(res, {
+          rule: 'quota',
+          retryAfterSeconds: result.retryAfterSeconds ?? 3_600,
+        });
+      }
+
       res.status(CREATE_ERROR_STATUS[result.code]).json({
         error: result.code,
         message: result.message,
@@ -135,8 +154,6 @@ export function createApiLinksRouter({
   });
 
   router.get('/links/:alias', async (req, res) => {
-    res.set('Cache-Control', 'no-store');
-
     const limited = enforceLookupRateLimits(
       rateLimiter,
       getClientIpHash(req, ipHashSecret),
@@ -155,6 +172,13 @@ export function createApiLinksRouter({
     }
 
     const alias = req.params.alias ?? '';
+
+    // Un alias que no puede existir no merece una consulta a la DB.
+    if (!CUSTOM_ALIAS_PATTERN.test(alias)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+
     const result = await service.getMetadata(alias);
 
     if (!result.ok) {

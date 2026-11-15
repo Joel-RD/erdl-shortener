@@ -12,6 +12,7 @@ import {
   DEFAULT_CREATE_IP_RULES,
   DEFAULT_LOOKUP_IP_RULES,
   DEFAULT_REDIRECT_IP_RULES,
+  DEFAULT_REQUEST_IP_RULES,
   type RateLimiter,
   type RateLimitRule,
 } from './abuse/rate-limit.js';
@@ -23,7 +24,12 @@ import { createAdminRouter } from './routes/api-admin.js';
 import { createApiLinksRouter } from './routes/api-links.js';
 import { createPagesRouter } from './routes/pages.js';
 import { createRedirectRouter } from './routes/redirect.js';
-import { wantsHtml } from './routes/shared.js';
+import {
+  enforceRequestRateLimits,
+  getClientIpHash,
+  setRetryAfter,
+  wantsHtml,
+} from './routes/shared.js';
 import { renderErrorPage } from './ui/pages.js';
 import { logger as defaultLogger } from './logger.js';
 
@@ -32,6 +38,7 @@ export type AppRateLimits = {
   createGlobal?: readonly RateLimitRule[] | undefined;
   redirectIp?: readonly RateLimitRule[] | undefined;
   lookupIp?: readonly RateLimitRule[] | undefined;
+  requestIp?: readonly RateLimitRule[] | undefined;
 };
 
 export type AppOptions = {
@@ -101,6 +108,8 @@ export function createApp(options: AppOptions = {}): express.Express {
     options.limits?.redirectIp ?? DEFAULT_REDIRECT_IP_RULES;
   const lookupIpRules =
     options.limits?.lookupIp ?? DEFAULT_LOOKUP_IP_RULES;
+  const requestIpRules =
+    options.limits?.requestIp ?? DEFAULT_REQUEST_IP_RULES;
 
   const service = createLinkService({
     db,
@@ -149,6 +158,9 @@ export function createApp(options: AppOptions = {}): express.Express {
       },
       referrerPolicy: { policy: 'no-referrer' },
       xFrameOptions: { action: 'deny' },
+      // HSTS solo tiene sentido detrás de HTTPS real; en local/test rompería
+      // http://localhost y los tests de supertest.
+      ...(config.isProduction ? {} : { strictTransportSecurity: false }),
     }),
   );
 
@@ -167,16 +179,112 @@ export function createApp(options: AppOptions = {}): express.Express {
         }),
       },
       autoLogging: {
-        ignore: (req) => req.url?.split('?')[0] === '/health',
+        ignore: (req) =>
+          req.url?.split('?')[0] === '/health' ||
+          req.url?.split('?')[0] === '/ready',
       },
     }),
   );
 
+  // Freno de peticiones mutantes ANTES de los body parsers: un flood de
+  // cuerpos grandes no debe llegar a express.json ni a la validación.
+  app.use((req, res, next) => {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+      next();
+      return;
+    }
+
+    const limited = enforceRequestRateLimits(
+      rateLimiter,
+      getClientIpHash(req, ipHashSecret),
+      requestIpRules,
+      now().getTime(),
+    );
+
+    if (!limited) {
+      next();
+      return;
+    }
+
+    setRetryAfter(res, limited);
+
+    if (wantsHtml(req) && !req.path.startsWith('/api/')) {
+      res
+        .status(429)
+        .set('Cache-Control', 'no-store')
+        .type('html')
+        .send(
+          renderErrorPage({
+            status: 429,
+            title: 'Demasiadas peticiones',
+            message:
+              'Has hecho demasiadas peticiones seguidas. Espera un momento y vuelve a intentarlo.',
+            abuseContactEmail,
+          }),
+        );
+      return;
+    }
+
+    res
+      .status(429)
+      .set('Cache-Control', 'no-store')
+      .json({
+        error: 'rate_limited',
+        message: 'Demasiadas peticiones. Inténtalo de nuevo más tarde.',
+        retryAfter: limited.retryAfterSeconds,
+      });
+  });
+
   app.use(express.json({ limit: '16kb' }));
-  app.use(express.urlencoded({ extended: false, limit: '16kb' }));
+
+  // La API solo acepta JSON. Sin esto, un formulario urlencoded llegaría como
+  // `{}` y el error sería un 400 confuso (o peor: un 201 con otro parser).
+  app.use('/api/v1', (req, res, next) => {
+    if (!['POST', 'PUT', 'PATCH'].includes(req.method)) {
+      next();
+      return;
+    }
+
+    const contentType = (req.headers['content-type'] ?? '')
+      .split(';')[0]
+      ?.trim()
+      .toLowerCase();
+
+    if (contentType !== 'application/json') {
+      res.set('Cache-Control', 'no-store').status(415).json({
+        error: 'unsupported_media_type',
+        message: 'La API solo acepta application/json.',
+      });
+      return;
+    }
+
+    next();
+  });
 
   app.get('/health', (_req, res) => {
     res.status(200).json({ status: 'ok' });
+  });
+
+  app.get('/ready', async (req, res) => {
+    // Un 200 de /health dice que el proceso vive; /ready además comprueba que
+    // la DB responde. El timeout evita que Render espere al cliente libSQL.
+    let timer: NodeJS.Timeout | undefined;
+
+    try {
+      const probe = db.execute('SELECT 1');
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('ready_timeout')), 2_000);
+        timer.unref();
+      });
+
+      await Promise.race([probe, timeout]);
+      res.status(200).json({ status: 'ready' });
+    } catch (error) {
+      req.log?.error?.({ err: error }, 'readiness_failed');
+      res.status(503).json({ status: 'unavailable' });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   });
 
   app.use(
@@ -270,13 +378,27 @@ export function createApp(options: AppOptions = {}): express.Express {
     if (status >= 500) {
       req.log.error({ err }, 'unhandled_error');
     } else {
-      req.log.warn({ err, status }, 'request_error');
+      // Un 4xx suele venir de un parser o de un middleware de Express con
+      // `body`/`raw` adjuntos. Loguear solo el contrato evita filtrar el
+      // cuerpo (posibles secretos) y mantiene la línea pequeña.
+      const type =
+        typeof err === 'object' && err !== null && 'type' in err
+          ? String((err as { type?: unknown }).type)
+          : 'unknown';
+      const message =
+        typeof err === 'object' && err !== null && 'message' in err
+          ? String((err as { message?: unknown }).message).slice(0, 200)
+          : 'unknown';
+
+      req.log.warn({ type, status, message }, 'request_error');
     }
 
     if (res.headersSent) {
       next(err);
       return;
     }
+
+    res.set('Cache-Control', 'no-store');
 
     if (wantsHtml(req) && !req.path.startsWith('/api/')) {
       res
@@ -297,14 +419,22 @@ export function createApp(options: AppOptions = {}): express.Express {
       return;
     }
 
-    res.status(status).json({
-      error:
-        status === 413
-          ? 'payload_too_large'
-          : status === 400
-            ? 'bad_request'
-            : 'internal_error',
-    });
+    const errorCode =
+      status === 413
+        ? 'payload_too_large'
+        : status === 415
+          ? 'unsupported_media_type'
+          : status === 401
+            ? 'unauthorized'
+            : status === 403
+              ? 'forbidden'
+              : status === 400
+                ? 'bad_request'
+                : status >= 500
+                  ? 'internal_error'
+                  : 'bad_request';
+
+    res.status(status).json({ error: errorCode });
   };
 
   app.use(errorHandler);

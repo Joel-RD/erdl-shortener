@@ -36,7 +36,8 @@ openssl rand -hex 32   # FORM_TOKEN_SECRET (opcional)
 npm run dev
 ```
 
-La primera ejecución aplica `migrations/001_init.sql` sobre `file:local.db`.
+La primera ejecución aplica `migrations/001_init.sql` y
+`migrations/002_retention_index.sql` sobre `file:local.db`.
 
 Comprobaciones rápidas:
 
@@ -58,7 +59,7 @@ npm run dev        # tsx watch
 npm run build      # tsc a dist/
 npm start          # node dist/server.js
 npm run typecheck  # tsc --noEmit
-npm test           # Vitest (157+ tests)
+npm test           # Vitest (175+ tests)
 npm run test:watch
 ```
 
@@ -70,9 +71,10 @@ npm run test:watch
 | `ADMIN_TOKEN` | Sí | — | Bearer del admin (mín. 16 caracteres) |
 | `IP_HASH_SECRET` | Sí | — | HMAC de IPs para límites, cuota y dedupe |
 | `FORM_TOKEN_SECRET` | No | `ADMIN_TOKEN` | Firma del honeypot; conviene uno distinto |
-| `DATABASE_URL` | No | `file:local.db` | SQLite local o `libsql://…` de Turso |
+| `DATABASE_URL` | No | `file:local.db` | SQLite local o `libsql://…` de Turso (remota obligatoria en producción) |
 | `DATABASE_AUTH_TOKEN` | No | — | Token de Turso |
-| `IP_RETENTION_DAYS` | No | `45` | Días antes de anonimizar el hash de IP |
+| `ALLOW_LOCAL_DB` | No | `false` | Permite `file:` en producción de forma explícita |
+| `IP_RETENTION_DAYS` | No | `45` | Días antes de anonimizar el hash de IP (30–90) |
 | `TRUST_PROXY` | No | `0` | `1` detrás del proxy de Render |
 | `PORT` | No | `3000` | Puerto HTTP |
 | `LOG_LEVEL` | No | `info` | Nivel de pino |
@@ -84,6 +86,7 @@ npm run test:watch
 | Método | Ruta | Auth | Respuesta |
 | --- | --- | --- | --- |
 | `GET` | `/health` | — | `200 {"status":"ok"}` |
+| `GET` | `/ready` | — | `200` si la DB responde; `503` si no |
 | `POST` | `/api/v1/links` | — | `201` enlace + `Location` |
 | `GET` | `/api/v1/links/:alias` | — | `200` metadata, `404`, `410` |
 | `GET` | `/:alias` | — | `302 no-store`, `404`, `410` |
@@ -102,6 +105,10 @@ curl -s -X POST http://localhost:3000/api/v1/links \
     "expiresAt": "2026-12-31T23:59:00.000Z"
   }'
 ```
+
+La API solo acepta `Content-Type: application/json`; un formulario
+`application/x-www-form-urlencoded` recibe `415`. El formulario SSR usa su
+propio parser únicamente en `POST /links`.
 
 La expiración debe estar entre 5 minutos y 1 año desde ahora. Un alias
 duplicado devuelve `409`. Un enlace vencido o retirado devuelve `410`, nunca
@@ -161,25 +168,34 @@ retira con `DELETE /api/v1/links/:alias`.
 - `jobs/retention.ts` corre al arrancar y cada 6 h: pone `created_ip_hash = NULL`
   en filas con `created_at` anterior a `IP_RETENTION_DAYS`.
 - Los logs HTTP **no** incluyen la IP del cliente (`remoteAddress` y
-  `remotePort` se eliminan del serializer de `pino-http`): la única huella de
-  red persistente es el HMAC con retención limitada.
+  `remotePort` se eliminan del serializer de `pino-http`), ni cabeceras de
+  proxy (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`), ni `Referer`, ni
+  cuerpos de error: la única huella de red persistente es el HMAC con
+  retención limitada.
 - **Consecuencia consciente:** esas filas dejan de contar para la cuota y el
   dedupe de esa IP. Es una decisión de privacidad, no un bug.
 
 ## Límites de abuso
 
-- Crear: 5/min, 30/h y 100/día por IP + 500/h global.
+- Peticiones mutantes (POST/PUT/PATCH/DELETE): 120/min por IP, antes de
+  parsear el cuerpo.
+- Crear: 5/min, 30/h y 100/día por IP + 2000/h global. El cupo se consume
+  después de validar el cuerpo (Zod, honeypot y token), así que un envío
+  inválido no lo gasta.
 - Redirects: 300/min por IP.
 - Lecturas públicas (`GET /api/v1/links/:alias` y `GET /?created=`): 60/min por
   IP, con `429` + `Retry-After`. La portada sin `created` no se limita.
-- Cuota: 50 enlaces activos por IP.
+- Cuota: 50 enlaces activos por IP; al superarla, `429` con `Retry-After`
+  estimado a partir de la caducidad más próxima.
 - Dedupe: misma URL normalizada + misma IP + misma caducidad (o ambas sin
   caducidad) en 24 h devuelve el alias existente. Si se pide una caducidad
   distinta se crea un enlace nuevo, para no devolver uno con otra vida útil.
-- Formulario: token HMAC (`timestamp.firma`) con antigüedad mínima de 3 s,
-  máximo 2 h, campo trampa `website` y rechazo genérico.
+- Formulario: token HMAC (`timestamp.firma`) ligado al HMAC de la IP, con
+  antigüedad mínima de 3 s y máxima de 30 min, campo trampa `website` y
+  rechazo genérico.
 - Blocklist: dominio registrable con `tldts`; bloquea subdominios, no sufijos
-  parecidos (`example.co.uk` ≠ `notexample.co.uk`).
+  parecidos (`example.co.uk` ≠ `notexample.co.uk`) y rechaza sufijos públicos
+  (`com`, `co.uk`) para no bloquear medio Internet.
 
 ## Despliegue en Render
 
@@ -190,7 +206,11 @@ retira con `DELETE /api/v1/links/:alias`.
 3. Rellenar los secretos marcados `sync: false` (`BASE_URL`,
    `DATABASE_URL`, `DATABASE_AUTH_TOKEN`, `ABUSE_CONTACT_EMAIL`).
 4. Dejar `TRUST_PROXY=1` y `IP_RETENTION_DAYS=45`.
-5. Verificar `/health` y crear un enlace de prueba.
+5. Verificar `/ready` (incluye una consulta a la DB) y crear un enlace de
+   prueba.
+
+El build usa `npm ci --include=dev` porque `NODE_ENV=production` haría que npm
+omitiera TypeScript y `npm run build` fallaría.
 
 El plan `free` de Render duerme la instancia; este MVP asume **una sola
 instancia always-on** porque caché, rate limiter y buffer de clics viven en
@@ -216,7 +236,7 @@ sequenceDiagram
   A->>S: create(input)
   S->>V: normalizar URL + dominio bloqueado
   V-->>S: URL canónica / domain_blocked
-  S->>D: dedupe, cuota, INSERT
+  S->>D: transacción: dedupe, cuota, INSERT
   D-->>S: fila
   S-->>A: LinkRecord
   A-->>C: 201 + Location

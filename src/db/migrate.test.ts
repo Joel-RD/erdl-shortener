@@ -54,7 +54,7 @@ describe('runMigrations', () => {
 
     const applied = await runMigrations(client);
 
-    expect(applied).toEqual(['001_init.sql']);
+    expect(applied).toEqual(['001_init.sql', '002_retention_index.sql']);
     expect(await tableNames(client)).toEqual(
       expect.arrayContaining([
         'blocked_domains',
@@ -81,6 +81,7 @@ describe('runMigrations', () => {
       'idx_links_dedupe',
       'idx_links_domain',
       'idx_links_expires_at',
+      'idx_links_retention',
     ]);
   });
 
@@ -95,7 +96,7 @@ describe('runMigrations', () => {
     const count = await client.execute(
       'SELECT COUNT(*) AS total FROM schema_migrations',
     );
-    expect(Number(count.rows[0]?.total)).toBe(1);
+    expect(Number(count.rows[0]?.total)).toBe(2);
   });
 
   it('deja la DB local en modo WAL', async () => {

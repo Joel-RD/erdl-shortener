@@ -147,6 +147,13 @@ function parseIpv6(value: string): number[] | null {
   return bytes;
 }
 
+function startsWithBytes(
+  bytes: readonly number[],
+  prefix: readonly number[],
+): boolean {
+  return prefix.every((byte, index) => bytes[index] === byte);
+}
+
 function isPrivateIpv6(bytes: readonly number[]): boolean {
   if (bytes.length !== 16) return false;
 
@@ -159,6 +166,10 @@ function isPrivateIpv6(bytes: readonly number[]): boolean {
   const uniqueLocal = (bytes[0]! & 0xfe) === 0xfc;
   const linkLocal =
     bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0x80;
+  // Site-local (fec0::/10) está obsoleto, pero sigue siendo una dirección
+  // interna y no debe usarse como destino público.
+  const siteLocal =
+    bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0xc0;
   const multicast = bytes[0] === 0xff;
   const documentation =
     bytes[0] === 0x20 &&
@@ -166,13 +177,42 @@ function isPrivateIpv6(bytes: readonly number[]): boolean {
     bytes[2] === 0x0d &&
     bytes[3] === 0xb8;
 
-  if (uniqueLocal || linkLocal || multicast || documentation) return true;
+  // Teredo (2001::/32) y discard-only (100::/64) no son destinos legítimos.
+  const teredo = startsWithBytes(bytes, [0x20, 0x01, 0x00, 0x00]);
+  const discardOnly = startsWithBytes(bytes, [
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ]);
+
+  if (
+    uniqueLocal ||
+    linkLocal ||
+    siteLocal ||
+    multicast ||
+    documentation ||
+    teredo ||
+    discardOnly
+  ) {
+    return true;
+  }
 
   const firstTenZero = bytes.slice(0, 10).every((byte) => byte === 0);
   const ipv4Mapped =
     firstTenZero && bytes[10] === 0xff && bytes[11] === 0xff;
 
   if (ipv4Mapped) {
+    return isPrivateIpv4(bytes.slice(12));
+  }
+
+  // IPv4-translated (::ffff:0:0/96): primeros 8 bytes a cero, `ffff` y dos
+  // ceros, con la IPv4 en los últimos 4 bytes.
+  const ipv4Translated =
+    bytes.slice(0, 8).every((byte) => byte === 0) &&
+    bytes[8] === 0xff &&
+    bytes[9] === 0xff &&
+    bytes[10] === 0x00 &&
+    bytes[11] === 0x00;
+
+  if (ipv4Translated) {
     return isPrivateIpv4(bytes.slice(12));
   }
 
@@ -195,6 +235,11 @@ function isPrivateIpv6(bytes: readonly number[]): boolean {
 
   if (nat64) return isPrivateIpv4(bytes.slice(12));
 
+  // NAT64 de uso local (64:ff9b:1::/48) tampoco es un destino público.
+  if (startsWithBytes(bytes, [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01])) {
+    return true;
+  }
+
   return false;
 }
 
@@ -216,8 +261,17 @@ function isLocalHostname(host: string): boolean {
     normalized.endsWith('.localhost') ||
     normalized === 'local' ||
     normalized.endsWith('.local') ||
+    normalized === 'internal' ||
     normalized.endsWith('.internal') ||
-    normalized.endsWith('.home.arpa')
+    // home.arpa es el dominio reservado para redes domésticas (RFC 8375).
+    normalized === 'home.arpa' ||
+    normalized.endsWith('.home.arpa') ||
+    // Sufijos usados en redes privadas que nunca deben resolver en Internet.
+    normalized.endsWith('.lan') ||
+    normalized.endsWith('.corp') ||
+    normalized.endsWith('.home') ||
+    normalized.endsWith('.intranet') ||
+    normalized.endsWith('.private')
   );
 }
 

@@ -2,8 +2,11 @@ import { config as loadDotenv } from 'dotenv';
 import { z } from 'zod';
 
 // Carga .env si existe. En producción las variables vienen del entorno
-// (Render) y dotenv nunca sobrescribe las que ya están definidas.
-loadDotenv({ quiet: true });
+// (Render) y dotenv nunca sobrescribe las que ya están definidas. En tests no
+// se carga: la suite fija su propio entorno en vitest.config.ts.
+if (process.env.NODE_ENV !== 'test') {
+  loadDotenv({ quiet: true });
+}
 
 const logLevels = [
   'fatal',
@@ -58,13 +61,22 @@ const envSchema = z.object({
       .min(16, 'FORM_TOKEN_SECRET debe tener al menos 16 caracteres')
       .optional(),
   ),
-  // Días que se conserva el HMAC de la IP antes de anonimizarlo.
-  IP_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(45),
+  // Días que se conserva el HMAC de la IP antes de anonimizarlo (30–90).
+  IP_RETENTION_DAYS: z.coerce.number().int().min(30).max(90).default(45),
   LOG_LEVEL: z.enum(logLevels).default('info'),
   // 0 = sin proxy (local). En Render debe ser 1.
   TRUST_PROXY: z.coerce.number().int().min(0).max(10).default(0),
   // Dev/tests: file:local.db (SQLite con WAL). Prod: libsql://... (Turso).
   DATABASE_URL: databaseUrlSchema.default('file:local.db'),
+  // Escape hatch consciente para producción sin Turso (p. ej. volumen local).
+  // Acepta 1/true/yes/on; cualquier otra cosa es false (incluido "false").
+  ALLOW_LOCAL_DB: z.preprocess(
+    (value) =>
+      typeof value === 'string'
+        ? ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
+        : value,
+    z.boolean(),
+  ).default(false),
   // Turso lo exige; en local va vacío y se normaliza a undefined.
   DATABASE_AUTH_TOKEN: z.preprocess(
     (value) =>
@@ -77,6 +89,21 @@ const envSchema = z.object({
       typeof value === 'string' && value.trim() === '' ? undefined : value,
     z.string().trim().email('ABUSE_CONTACT_EMAIL no es un correo válido').optional(),
   ),
+}).superRefine((data, ctx) => {
+  // Una SQLite en el disco de Render se pierde en cada deploy y no es apta
+  // para una instancia efímera. Se permite solo con una decisión explícita.
+  if (
+    data.NODE_ENV === 'production' &&
+    data.DATABASE_URL.startsWith('file:') &&
+    !data.ALLOW_LOCAL_DB
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['DATABASE_URL'],
+      message:
+        'DATABASE_URL debe ser remota en producción (usa ALLOW_LOCAL_DB=true para forzar SQLite local)',
+    });
+  }
 });
 
 export type Config = {
@@ -92,6 +119,7 @@ export type Config = {
   trustProxy: number;
   databaseUrl: string;
   databaseAuthToken: string | undefined;
+  allowLocalDb: boolean;
   abuseContactEmail: string | undefined;
 };
 
@@ -123,6 +151,7 @@ export function parseConfig(
     trustProxy: data.TRUST_PROXY,
     databaseUrl: data.DATABASE_URL,
     databaseAuthToken: data.DATABASE_AUTH_TOKEN,
+    allowLocalDb: data.ALLOW_LOCAL_DB,
     abuseContactEmail: data.ABUSE_CONTACT_EMAIL,
   };
 }

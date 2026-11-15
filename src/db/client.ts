@@ -8,12 +8,25 @@ type DatabaseOptions = {
   authToken?: string | undefined;
 };
 
+/** Turso no debe colgar una petición HTTP más de esto. */
+const REMOTE_NETWORK_TIMEOUT_MS = 10_000;
+
+const fetchWithTimeout: typeof fetch = (input, init) => {
+  const timeout = AbortSignal.timeout(REMOTE_NETWORK_TIMEOUT_MS);
+  const signal = init?.signal
+    ? AbortSignal.any([init.signal, timeout])
+    : timeout;
+
+  return fetch(input, { ...init, signal });
+};
+
 /**
  * Crea el cliente de libSQL. El mismo tipo de cliente sirve para SQLite local
  * (`file:local.db`) y para Turso (`libsql://...`): solo cambia la URL.
  */
 export function createDatabaseClient(options: DatabaseOptions): DatabaseClient {
   const authToken = options.authToken?.trim();
+  const isLocal = options.url.startsWith('file:');
 
   return createClient({
     url: options.url,
@@ -21,6 +34,9 @@ export function createDatabaseClient(options: DatabaseOptions): DatabaseClient {
     ...(authToken ? { authToken } : {}),
     // Si otra conexión mantiene el lock de escritura, esperar en vez de fallar.
     timeout: 5_000,
+    // En remoto, un fetch colgado consume el turno de la petición hasta que
+    // Render corta. AbortSignal.timeout lo convierte en un error accionable.
+    ...(isLocal ? {} : { fetch: fetchWithTimeout }),
   });
 }
 
