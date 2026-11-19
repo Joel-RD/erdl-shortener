@@ -5,7 +5,7 @@ MVP de acortador de URLs sin cuentas. Express 5 + TypeScript estricto + libSQL
 takedown administrativo, expiración y retención de IPs.
 
 La guía de construcción por fases está en
-[`plan-MVP-acortador-url.md`](./plan-MVP-acortador-url.md).
+[`docs/plan-MVP-acortador-url.md`](./docs/plan-MVP-acortador-url.md).
 
 ## Estado: fases 0–9 completas
 
@@ -24,7 +24,7 @@ La guía de construcción por fases está en
 
 ## Arranque local
 
-Requisitos: Node.js 22 o superior.
+Requisitos: Node.js 24 o superior.
 
 ```bash
 npm ci
@@ -37,7 +37,7 @@ npm run dev
 ```
 
 La primera ejecución aplica `migrations/001_init.sql` y
-`migrations/002_retention_index.sql` sobre `file:local.db`.
+`migrations/002_retention_index.sql` sobre `file:./data/local.db`.
 
 Comprobaciones rápidas:
 
@@ -65,6 +65,27 @@ npm test             # Vitest (191 tests)
 npm run test:watch
 ```
 
+## Estructura del proyecto
+
+`src/` se organiza por capas explícitas; `app.ts` es el único composition
+root:
+
+```
+src/
+├── server.ts · app.ts · config.ts · logger.ts
+├── domain/     reglas puras de enlaces y blocklist
+├── infra/      SQL, caché, buffer de clics y jobs
+├── security/   HMAC de IP, honeypot y rate limiter
+├── http/       rutas, middleware y presentadores
+└── ui/         SSR puro (layout y páginas)
+tests/          espejo de src/ (helpers + integración HTTP)
+```
+
+Reglas de dependencia: `domain` no importa Express, libSQL, `fs` ni pino;
+`infra` y `security` no importan `http`/`ui`; `http` no importa la persistencia
+de `infra`. El detalle y el árbol completo están en
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
+
 ## Variables de entorno
 
 | Variable | Obligatoria | Default | Uso |
@@ -73,7 +94,7 @@ npm run test:watch
 | `ADMIN_TOKEN` | Sí | — | Bearer del admin (mín. 16 caracteres) |
 | `IP_HASH_SECRET` | Sí | — | HMAC de IPs para límites, cuota y dedupe |
 | `FORM_TOKEN_SECRET` | No | `ADMIN_TOKEN` | Firma del honeypot; conviene uno distinto |
-| `DATABASE_URL` | No | `file:local.db` | SQLite local o `libsql://…` de Turso (remota obligatoria en producción) |
+| `DATABASE_URL` | No | `file:./data/local.db` | SQLite local o `libsql://…` de Turso (remota obligatoria en producción) |
 | `DATABASE_AUTH_TOKEN` | No | — | Token de Turso |
 | `ALLOW_LOCAL_DB` | No | `false` | Permite `file:` en producción de forma explícita |
 | `IP_RETENTION_DAYS` | No | `45` | Días antes de anonimizar el hash de IP (30–90) |
@@ -349,21 +370,26 @@ sequenceDiagram
 
 ## Criterios de aceptación cubiertos
 
-La suite está en `src/**/*.test.ts`:
+La suite está en `tests/**/*.test.ts`, espejo de las capas de `src/`:
 
-- Health, CSP, estáticos y 404 HTML/JSON → `src/app.test.ts`.
-- Crear por API/formulario, alias duplicado, 410, XSS → `src/app.test.ts`.
-- Dedupe, cuota, rate limit 429 + `Retry-After` → `src/app.test.ts`,
-  `src/links/service.abuse.test.ts`, `src/abuse/rate-limit.test.ts`.
-- 300 resoluciones = 1 lectura, TTL, 404 no cacheado → `src/links/service.abuse.test.ts`.
-- Blocklist semilla/manual, subdominios, TTL 60 s → `src/abuse/blocklist.test.ts`.
-- Honeypot manipulado/ausente/rápido → `src/abuse/form-token.test.ts` y
-  `src/app.test.ts`.
-- Token admin constante e invalidez → `src/abuse/admin-auth.test.ts`;
-  redacción de logs → `src/logger.test.ts`.
-- Takedown invalida caché → `src/app.test.ts`.
-- Retención y su efecto en cuota → `src/jobs/retention.test.ts`.
-- SIGTERM persiste clics → `src/server.shutdown.test.ts`.
+- Health, CSP, estáticos y 404 HTML/JSON → `tests/http/health.test.ts`.
+- Crear por API/formulario, alias duplicado, 410, XSS →
+  `tests/http/api-links.test.ts` y `tests/http/home.test.ts`.
+- Dedupe, cuota, rate limit 429 + `Retry-After` →
+  `tests/http/rate-limits.test.ts`, `tests/domain/links/service.abuse.test.ts`,
+  `tests/security/rate-limit.test.ts`.
+- 300 resoluciones = 1 lectura, TTL, 404 no cacheado →
+  `tests/domain/links/service.abuse.test.ts`.
+- Blocklist semilla/manual, subdominios, TTL 60 s →
+  `tests/infra/db/blocklist-store.test.ts`.
+- Honeypot manipulado/ausente/rápido → `tests/security/form-token.test.ts` y
+  `tests/http/abuse.test.ts`.
+- Token admin constante e invalidez →
+  `tests/http/middleware/admin-auth.test.ts`; redacción de logs →
+  `tests/logger.test.ts`.
+- Takedown invalida caché → `tests/http/admin.test.ts`.
+- Retención y su efecto en cuota → `tests/infra/jobs/retention.test.ts`.
+- SIGTERM persiste clics → `tests/server.shutdown.test.ts`.
 
 ## Limitaciones conocidas
 

@@ -13,6 +13,7 @@ coverage/
 *.db-shm
 *.db-wal
 
-# Notas del plan
+# Documentación (solo se versiona README y docs/)
 **/*.md
 !README.md
+!docs/**/*.md

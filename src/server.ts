@@ -1,9 +1,9 @@
 import { createServer } from 'node:http';
 import { createApp, getAppRuntime } from './app.js';
 import { config } from './config.js';
-import { configureDatabase, db } from './db/client.js';
-import { runMigrations } from './db/migrate.js';
-import { createRetentionJob } from './jobs/retention.js';
+import { configureDatabase, db } from './infra/db/client.js';
+import { runMigrations } from './infra/db/migrate.js';
+import { createRetentionJob } from './infra/jobs/retention.js';
 import { logger } from './logger.js';
 
 async function start(): Promise<void> {

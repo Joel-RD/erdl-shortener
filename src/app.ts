@@ -1,11 +1,14 @@
 import { fileURLToPath } from 'node:url';
-import express, { type ErrorRequestHandler } from 'express';
-import helmet from 'helmet';
+import express from 'express';
 import type { Logger } from 'pino';
-import { stdSerializers } from 'pino';
-import { pinoHttp } from 'pino-http';
-import { createBlocklist, type Blocklist } from './abuse/blocklist.js';
-import { createClickBuffer, type ClickBuffer } from './abuse/click-buffer.js';
+import { createAliasCache, type AliasCache } from './infra/cache/alias-cache.js';
+import {
+  createClickBuffer,
+  type ClickBuffer,
+} from './infra/clicks/click-buffer.js';
+import { db as defaultDb, type DatabaseClient } from './infra/db/client.js';
+import { createBlocklistStore } from './infra/db/blocklist-store.js';
+import { createLinksRepository } from './infra/db/links-repository.js';
 import {
   createMemoryRateLimiter,
   DEFAULT_CREATE_GLOBAL_RULES,
@@ -15,22 +18,22 @@ import {
   DEFAULT_REQUEST_IP_RULES,
   type RateLimiter,
   type RateLimitRule,
-} from './abuse/rate-limit.js';
-import { createAliasCache, type AliasCache } from './cache/alias-cache.js';
+} from './security/rate-limit.js';
 import { config } from './config.js';
-import { db as defaultDb, type DatabaseClient } from './db/client.js';
-import { createLinkService } from './links/service.js';
-import { createAdminRouter } from './routes/api-admin.js';
-import { createApiLinksRouter } from './routes/api-links.js';
-import { createPagesRouter } from './routes/pages.js';
-import { createRedirectRouter } from './routes/redirect.js';
+import { createLinkService } from './domain/links/service.js';
+import { createAdminRouter } from './http/routes/api-admin.js';
+import { createApiLinksRouter } from './http/routes/api-links.js';
+import { createPagesRouter } from './http/routes/home.js';
+import { createRedirectRouter } from './http/routes/redirect.js';
+import { registerHealthRoutes } from './http/routes/health.js';
+import { requireJsonContentType } from './http/middleware/content-type.js';
 import {
-  enforceRequestRateLimits,
-  getClientIpHash,
-  setRetryAfter,
-  wantsHtml,
-} from './routes/shared.js';
-import { renderErrorPage } from './ui/pages.js';
+  createErrorHandler,
+  createNotFoundHandler,
+} from './http/middleware/errors.js';
+import { createHttpLogger } from './http/middleware/logging.js';
+import { createRequestRateLimit } from './http/middleware/rate-limits.js';
+import { createSecurityHeaders } from './http/middleware/security-headers.js';
 import { logger as defaultLogger } from './logger.js';
 
 export type AppRateLimits = {
@@ -48,7 +51,7 @@ export type AppOptions = {
   cache?: AliasCache | undefined;
   clickBuffer?: ClickBuffer | undefined;
   rateLimiter?: RateLimiter | undefined;
-  blocklist?: Blocklist | undefined;
+  blocklist?: ReturnType<typeof createBlocklistStore> | undefined;
   adminToken?: string | undefined;
   formTokenSecret?: string | undefined;
   formTokenMinAgeMs?: number | undefined;
@@ -94,7 +97,7 @@ export function createApp(options: AppOptions = {}): express.Express {
     createMemoryRateLimiter({ now: () => now().getTime() });
   const blocklist =
     options.blocklist ??
-    createBlocklist({
+    createBlocklistStore({
       db,
       ownDomain: new URL(config.baseUrl).hostname,
       now,
@@ -112,7 +115,7 @@ export function createApp(options: AppOptions = {}): express.Express {
     options.limits?.requestIp ?? DEFAULT_REQUEST_IP_RULES;
 
   const service = createLinkService({
-    db,
+    repository: createLinksRepository(db),
     now,
     cache,
     clickBuffer,
@@ -139,153 +142,23 @@ export function createApp(options: AppOptions = {}): express.Express {
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy === 0 ? false : config.trustProxy);
 
+  app.use(createSecurityHeaders(config.isProduction));
+  app.use(createHttpLogger(httpLogger));
   app.use(
-    helmet({
-      contentSecurityPolicy: {
-        directives: {
-          defaultSrc: ["'self'"],
-          baseUri: ["'self'"],
-          connectSrc: ["'self'"],
-          fontSrc: ["'self'"],
-          formAction: ["'self'"],
-          frameAncestors: ["'none'"],
-          imgSrc: ["'self'", 'data:'],
-          objectSrc: ["'none'"],
-          scriptSrc: ["'self'"],
-          styleSrc: ["'self'"],
-          upgradeInsecureRequests: null,
-        },
-      },
-      referrerPolicy: { policy: 'no-referrer' },
-      xFrameOptions: { action: 'deny' },
-      // HSTS solo tiene sentido detrás de HTTPS real; en local/test rompería
-      // http://localhost y los tests de supertest.
-      ...(config.isProduction ? {} : { strictTransportSecurity: false }),
+    createRequestRateLimit({
+      limiter: rateLimiter,
+      ipHashSecret,
+      rules: requestIpRules,
+      now,
+      abuseContactEmail,
     }),
   );
-
-  app.use(
-    pinoHttp({
-      logger: httpLogger,
-      serializers: {
-        // La IP solo se guarda como HMAC con retención limitada. El
-        // serializer por defecto añadiría `remoteAddress` y `remotePort` en
-        // claro a cada línea de log, fuera de esa retención.
-        req: stdSerializers.wrapRequestSerializer((serialized) => {
-          const { remoteAddress: _address, remotePort: _port, ...rest } =
-            serialized;
-
-          return rest as typeof serialized;
-        }),
-      },
-      autoLogging: {
-        ignore: (req) =>
-          req.url?.split('?')[0] === '/health' ||
-          req.url?.split('?')[0] === '/ready',
-      },
-    }),
-  );
-
-  // Freno de peticiones mutantes ANTES de los body parsers: un flood de
-  // cuerpos grandes no debe llegar a express.json ni a la validación.
-  app.use((req, res, next) => {
-    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
-      next();
-      return;
-    }
-
-    const limited = enforceRequestRateLimits(
-      rateLimiter,
-      getClientIpHash(req, ipHashSecret),
-      requestIpRules,
-      now().getTime(),
-    );
-
-    if (!limited) {
-      next();
-      return;
-    }
-
-    setRetryAfter(res, limited);
-
-    if (wantsHtml(req) && !req.path.startsWith('/api/')) {
-      res
-        .status(429)
-        .set('Cache-Control', 'no-store')
-        .type('html')
-        .send(
-          renderErrorPage({
-            status: 429,
-            title: 'Demasiadas peticiones',
-            message:
-              'Has hecho demasiadas peticiones seguidas. Espera un momento y vuelve a intentarlo.',
-            abuseContactEmail,
-          }),
-        );
-      return;
-    }
-
-    res
-      .status(429)
-      .set('Cache-Control', 'no-store')
-      .json({
-        error: 'rate_limited',
-        message: 'Demasiadas peticiones. Inténtalo de nuevo más tarde.',
-        retryAfter: limited.retryAfterSeconds,
-      });
-  });
 
   app.use(express.json({ limit: '16kb' }));
 
-  // La API solo acepta JSON. Sin esto, un formulario urlencoded llegaría como
-  // `{}` y el error sería un 400 confuso (o peor: un 201 con otro parser).
-  app.use('/api/v1', (req, res, next) => {
-    if (!['POST', 'PUT', 'PATCH'].includes(req.method)) {
-      next();
-      return;
-    }
+  app.use('/api/v1', requireJsonContentType());
 
-    const contentType = (req.headers['content-type'] ?? '')
-      .split(';')[0]
-      ?.trim()
-      .toLowerCase();
-
-    if (contentType !== 'application/json') {
-      res.set('Cache-Control', 'no-store').status(415).json({
-        error: 'unsupported_media_type',
-        message: 'La API solo acepta application/json.',
-      });
-      return;
-    }
-
-    next();
-  });
-
-  app.get('/health', (_req, res) => {
-    res.status(200).json({ status: 'ok' });
-  });
-
-  app.get('/ready', async (req, res) => {
-    // Un 200 de /health dice que el proceso vive; /ready además comprueba que
-    // la DB responde. El timeout evita que Render espere al cliente libSQL.
-    let timer: NodeJS.Timeout | undefined;
-
-    try {
-      const probe = db.execute('SELECT 1');
-      const timeout = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error('ready_timeout')), 2_000);
-        timer.unref();
-      });
-
-      await Promise.race([probe, timeout]);
-      res.status(200).json({ status: 'ready' });
-    } catch (error) {
-      req.log?.error?.({ err: error }, 'readiness_failed');
-      res.status(503).json({ status: 'unavailable' });
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
-  });
+  registerHealthRoutes(app, db);
 
   app.use(
     express.static(PUBLIC_DIR, {
@@ -344,100 +217,8 @@ export function createApp(options: AppOptions = {}): express.Express {
     }),
   );
 
-  app.use((req, res) => {
-    if (wantsHtml(req) && !req.path.startsWith('/api/')) {
-      res
-        .status(404)
-        .set('Cache-Control', 'no-store')
-        .type('html')
-        .send(
-          renderErrorPage({
-            status: 404,
-            title: 'Página no encontrada',
-            message: 'La ruta que buscas no existe en este servidor.',
-            abuseContactEmail,
-          }),
-        );
-      return;
-    }
-
-    res.status(404).json({ error: 'not_found' });
-  });
-
-  const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
-    const rawStatus =
-      typeof err === 'object' && err !== null && 'status' in err
-        ? Number((err as { status?: unknown }).status)
-        : Number.NaN;
-
-    const status =
-      Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus < 500
-        ? rawStatus
-        : 500;
-
-    if (status >= 500) {
-      req.log.error({ err }, 'unhandled_error');
-    } else {
-      // Un 4xx suele venir de un parser o de un middleware de Express con
-      // `body`/`raw` adjuntos. Loguear solo el contrato evita filtrar el
-      // cuerpo (posibles secretos) y mantiene la línea pequeña.
-      const type =
-        typeof err === 'object' && err !== null && 'type' in err
-          ? String((err as { type?: unknown }).type)
-          : 'unknown';
-      const message =
-        typeof err === 'object' && err !== null && 'message' in err
-          ? String((err as { message?: unknown }).message).slice(0, 200)
-          : 'unknown';
-
-      req.log.warn({ type, status, message }, 'request_error');
-    }
-
-    if (res.headersSent) {
-      next(err);
-      return;
-    }
-
-    res.set('Cache-Control', 'no-store');
-
-    if (wantsHtml(req) && !req.path.startsWith('/api/')) {
-      res
-        .status(status)
-        .set('Cache-Control', 'no-store')
-        .type('html')
-        .send(
-          renderErrorPage({
-            status,
-            title: status === 500 ? 'Algo salió mal' : 'Petición no válida',
-            message:
-              status === 500
-                ? 'Tuvimos un problema al procesar la petición. Inténtalo de nuevo.'
-                : 'La petición no se pudo procesar tal como llegó.',
-            abuseContactEmail,
-          }),
-        );
-      return;
-    }
-
-    const errorCode =
-      status === 413
-        ? 'payload_too_large'
-        : status === 415
-          ? 'unsupported_media_type'
-          : status === 401
-            ? 'unauthorized'
-            : status === 403
-              ? 'forbidden'
-              : status === 400
-                ? 'bad_request'
-                : status >= 500
-                  ? 'internal_error'
-                  : 'bad_request';
-
-    res.status(status).json({ error: errorCode });
-  };
-
-  app.use(errorHandler);
+  app.use(createNotFoundHandler({ abuseContactEmail }));
+  app.use(createErrorHandler({ abuseContactEmail }));
 
   return app;
 }
