@@ -12,6 +12,7 @@ import {
   setRetryAfter,
 } from '../middleware/rate-limits.js';
 import { wantsHtml } from '../negotiation.js';
+import { getRouteParam } from '../route-params.js';
 
 export type RedirectRouterOptions = {
   service: LinkService;
@@ -72,7 +73,7 @@ export function createRedirectRouter({
       return;
     }
 
-    const alias = req.params.alias ?? '';
+    const alias = getRouteParam(req, 'alias');
 
     res.set({
       'Cache-Control': 'no-store',

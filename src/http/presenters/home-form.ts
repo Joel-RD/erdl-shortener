@@ -1,3 +1,45 @@
+import {
+  CUSTOM_ALIAS_PATTERN,
+  MAX_CUSTOM_ALIAS_LENGTH,
+  MIN_CUSTOM_ALIAS_LENGTH,
+} from '../../domain/links/alias.js';
+import {
+  MAX_EXPIRATION_MS,
+  MIN_EXPIRATION_MS,
+} from '../../domain/links/expiration.js';
+import { MAX_URL_LENGTH } from '../../domain/links/validate.js';
+import type { HomeFormLimits } from '../../ui/pages/home.js';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const YEAR_DAYS = 365;
+
+/**
+ * Límites del formulario derivados de las reglas del dominio. La UI no importa
+ * `domain/`, así que recibe estos valores ya calculados.
+ */
+export function getHomeFormLimits(): HomeFormLimits {
+  const maxExpirationDays = MAX_EXPIRATION_MS / DAY_MS;
+  const minExpirationMinutes = MIN_EXPIRATION_MS / 60_000;
+  const maxExpirationYears = maxExpirationDays / YEAR_DAYS;
+
+  return {
+    urlMaxLength: MAX_URL_LENGTH,
+    aliasMinLength: MIN_CUSTOM_ALIAS_LENGTH,
+    aliasMaxLength: MAX_CUSTOM_ALIAS_LENGTH,
+    // `pattern` no necesita anclas: el navegador ya exige coincidencia completa.
+    aliasPattern: CUSTOM_ALIAS_PATTERN.source.replace(/^\^|\$$/g, ''),
+    expirationMinLabel: `${minExpirationMinutes} ${
+      minExpirationMinutes === 1 ? 'minuto' : 'minutos'
+    }`,
+    expirationMaxLabel:
+      maxExpirationDays % YEAR_DAYS === 0
+        ? `${maxExpirationYears} ${
+            maxExpirationYears === 1 ? 'año' : 'años'
+          }`
+        : `${maxExpirationDays} días`,
+  };
+}
+
 /** `YYYY-MM-DDTHH:mm` en UTC, el formato que entiende datetime-local. */
 export function formatDatetimeLocalUtc(date: Date): string {
   return date.toISOString().slice(0, 16);

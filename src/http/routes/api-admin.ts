@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { requireAdminToken } from '../middleware/admin-auth.js';
+import { getRouteParam } from '../route-params.js';
 import {
   normalizeBlocklistDomain,
   type Blocklist,
@@ -46,10 +47,7 @@ export function createAdminRouter({
   });
 
   router.delete('/links/:alias', auth, async (req, res) => {
-    const aliasParam = req.params.alias;
-    const alias = Array.isArray(aliasParam)
-      ? (aliasParam[0] ?? '')
-      : (aliasParam ?? '');
+    const alias = getRouteParam(req, 'alias');
     const result = await service.disable(alias);
 
     if (!result.ok) {

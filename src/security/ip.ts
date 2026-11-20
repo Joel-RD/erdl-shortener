@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { isIP } from 'node:net';
+import { parseIpv6Groups } from '../net/ip.js';
 
 /**
  * Identidad de red para límites, cuotas y dedupe.
@@ -17,80 +18,6 @@ import { isIP } from 'node:net';
  */
 
 const IPV4_MAPPED = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i;
-
-function parseIpv4Groups(value: string): number[] | null {
-  const parts = value.split('.');
-
-  if (parts.length !== 4) return null;
-
-  const octets = parts.map((part) => Number(part));
-
-  if (
-    octets.some(
-      (octet) => !Number.isInteger(octet) || octet < 0 || octet > 255,
-    )
-  ) {
-    return null;
-  }
-
-  return octets;
-}
-
-/** Expande una IPv6 a 8 grupos de 16 bits; acepta IPv4 embebida. */
-function expandIpv6(value: string): number[] | null {
-  const withoutZone = value.split('%')[0] ?? '';
-
-  if (withoutZone.includes('::') && withoutZone.split('::').length > 2) {
-    return null;
-  }
-
-  const [headRaw = '', tailRaw = ''] = withoutZone.split('::');
-  const head = headRaw === '' ? [] : headRaw.split(':');
-  const tail = tailRaw === '' ? [] : tailRaw.split(':');
-
-  const parseGroups = (parts: string[]): number[] | null => {
-    const groups: number[] = [];
-
-    for (let index = 0; index < parts.length; index += 1) {
-      const part = parts[index] ?? '';
-
-      if (part.includes('.')) {
-        if (index !== parts.length - 1) return null;
-
-        const octets = parseIpv4Groups(part);
-        if (!octets) return null;
-
-        groups.push(
-          ((octets[0] ?? 0) << 8) | (octets[1] ?? 0),
-          ((octets[2] ?? 0) << 8) | (octets[3] ?? 0),
-        );
-      } else {
-        if (!/^[0-9a-f]{1,4}$/i.test(part)) return null;
-        groups.push(Number.parseInt(part, 16));
-      }
-    }
-
-    return groups;
-  };
-
-  const preparedHead = parseGroups(head);
-  const preparedTail = parseGroups(tail);
-
-  if (!preparedHead || !preparedTail) return null;
-
-  const compressed = withoutZone.includes('::');
-  const missing = 8 - preparedHead.length - preparedTail.length;
-
-  if (compressed ? missing < 1 : missing !== 0) return null;
-
-  const groups = [
-    ...preparedHead,
-    ...Array<number>(compressed ? missing : 0).fill(0),
-    ...preparedTail,
-  ];
-
-  return groups.length === 8 ? groups : null;
-}
 
 function formatIpv6(groups: readonly number[]): string {
   return groups.map((group) => group.toString(16)).join(':');
@@ -112,7 +39,7 @@ export function normalizeClientIp(raw: string | null | undefined): string {
   if (mapped?.[1]) return mapped[1];
 
   if (isIP(withoutZone) === 6) {
-    const groups = expandIpv6(withoutZone);
+    const groups = parseIpv6Groups(withoutZone);
     if (groups) return formatIpv6(groups);
   }
 
@@ -128,7 +55,7 @@ export function ipKey(raw: string | null | undefined): string {
 
   if (isIP(normalized) !== 6) return normalized;
 
-  const groups = expandIpv6(normalized);
+  const groups = parseIpv6Groups(normalized);
   if (!groups) return normalized;
 
   const prefix = groups

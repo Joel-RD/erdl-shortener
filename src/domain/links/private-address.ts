@@ -1,3 +1,9 @@
+import {
+  ipv6GroupsToBytes,
+  parseIpv4Octets,
+  parseIpv6Groups,
+} from '../../net/ip.js';
+
 /**
  * Detección de direcciones IP privadas, reservadas o no enrutables.
  *
@@ -26,83 +32,6 @@ function isPrivateIpv4(octets: readonly number[]): boolean {
   );
 }
 
-function parseIpv4(value: string): number[] | null {
-  const parts = value.split('.');
-  if (parts.length !== 4) return null;
-
-  const octets = parts.map((part) => Number(part));
-  if (
-    octets.some(
-      (octet) =>
-        !Number.isInteger(octet) || octet < 0 || octet > 255,
-    )
-  ) {
-    return null;
-  }
-
-  return octets;
-}
-
-/** Expande una IPv6 a 16 bytes; devuelve null si la forma no es válida. */
-function parseIpv6(value: string): number[] | null {
-  const withoutZone = value.split('%')[0] ?? '';
-
-  if (withoutZone.includes('::') && withoutZone.split('::').length > 2) {
-    return null;
-  }
-
-  const [headRaw = '', tailRaw = ''] = withoutZone.split('::');
-  const head = headRaw === '' ? [] : headRaw.split(':');
-  const tail = tailRaw === '' ? [] : tailRaw.split(':');
-
-  const prepare = (parts: string[]): string[] | null => {
-    const copy = [...parts];
-    const last = copy.at(-1);
-
-    if (last?.includes('.')) {
-      const ipv4 = parseIpv4(last);
-      if (!ipv4) return null;
-
-      const [a = 0, b = 0, c = 0, d = 0] = ipv4;
-      copy.splice(
-        copy.length - 1,
-        1,
-        ((a << 8) | b).toString(16),
-        ((c << 8) | d).toString(16),
-      );
-    }
-
-    return copy;
-  };
-
-  const preparedHead = prepare(head);
-  const preparedTail = prepare(tail);
-  if (!preparedHead || !preparedTail) return null;
-
-  const hasCompression = withoutZone.includes('::');
-  const missing = 8 - preparedHead.length - preparedTail.length;
-
-  if (hasCompression ? missing < 1 : missing !== 0) return null;
-
-  const groups = [
-    ...preparedHead,
-    ...Array<string>(hasCompression ? missing : 0).fill('0'),
-    ...preparedTail,
-  ];
-
-  if (groups.length !== 8) return null;
-
-  const bytes: number[] = [];
-
-  for (const group of groups) {
-    if (!/^[0-9a-f]{1,4}$/i.test(group)) return null;
-    const value = Number.parseInt(group, 16);
-    bytes.push((value >> 8) & 0xff, value & 0xff);
-  }
-
-  return bytes;
-}
-
 function startsWithBytes(
   bytes: readonly number[],
   prefix: readonly number[],
@@ -119,14 +48,14 @@ function isPrivateIpv6(bytes: readonly number[]): boolean {
 
   if (allZero || loopback) return true;
 
-  const uniqueLocal = (bytes[0]! & 0xfe) === 0xfc;
-  const linkLocal =
-    bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0x80;
+  const first = bytes[0] ?? 0;
+  const second = bytes[1] ?? 0;
+  const uniqueLocal = (first & 0xfe) === 0xfc;
+  const linkLocal = first === 0xfe && (second & 0xc0) === 0x80;
   // Site-local (fec0::/10) está obsoleto, pero sigue siendo una dirección
   // interna y no debe usarse como destino público.
-  const siteLocal =
-    bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0xc0;
-  const multicast = bytes[0] === 0xff;
+  const siteLocal = first === 0xfe && (second & 0xc0) === 0xc0;
+  const multicast = first === 0xff;
   const documentation =
     bytes[0] === 0x20 &&
     bytes[1] === 0x01 &&
@@ -200,11 +129,11 @@ function isPrivateIpv6(bytes: readonly number[]): boolean {
 }
 
 export function isPrivateAddress(host: string): boolean {
-  const ipv4 = parseIpv4(host);
+  const ipv4 = parseIpv4Octets(host);
   if (ipv4) return isPrivateIpv4(ipv4);
 
-  const ipv6 = parseIpv6(host);
-  if (ipv6) return isPrivateIpv6(ipv6);
+  const ipv6 = parseIpv6Groups(host);
+  if (ipv6) return isPrivateIpv6(ipv6GroupsToBytes(ipv6));
 
   return false;
 }

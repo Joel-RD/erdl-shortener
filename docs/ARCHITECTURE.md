@@ -39,6 +39,9 @@ src/
 │   ├── form-token.ts          # honeypot firmado
 │   └── rate-limit.ts          # limitador en memoria
 │
+├── net/                       # parsers puros compartidos
+│   └── ip.ts                  # IPv4/IPv6 textual, sin red ni DNS
+│
 ├── http/                      # adaptador HTTP
 │   ├── routes/
 │   │   ├── home.ts · redirect.ts
@@ -68,9 +71,10 @@ su ruta con `../../../` para funcionar igual desde `src/` y desde `dist/`.
 
 | Capa | Puede importar | No puede importar |
 |---|---|---|
-| `domain/` | `domain/`, node:crypto, librerías puras (`tldts`) | express, libsql, fs, pino, resto de capas |
+| `domain/` | `domain/`, `net/`, node:crypto, librerías puras (`tldts`) | express, libsql, fs, pino, resto de capas |
 | `infra/` | `domain/`, `config`, `logger` | `http/`, `ui/` |
-| `security/` | node:crypto, node:net | resto del proyecto |
+| `security/` | `net/`, node:crypto, node:net | resto del proyecto |
+| `net/` | node:net (si hace falta) | resto del proyecto |
 | `http/` | `domain/`, `ui/`, `security/`, `http/` | `infra/` (solo `app.ts` cablea) |
 | `ui/` | nada del proyecto | `domain`, `infra`, `http`, `security` |
 | `app.ts` | todo | — |
@@ -87,6 +91,7 @@ cuota y reintento por colisión de alias vive en el dominio, dentro de
 - `tests/domain/` — reglas puras y servicio con DB temporal.
 - `tests/infra/` — SQL, caché, clics, migraciones y retención.
 - `tests/security/` — HMAC, honeypot y rate limiter.
+- `tests/net/` — parsers puros de IPv4/IPv6 compartidos.
 - `tests/http/` — integración con supertest (`health`, `home`, `api-links`,
   `admin`, `abuse`, `rate-limits`, `regressions`).
 - `tests/helpers/` — `temp-db.ts` y `test-app.ts`.

@@ -10,7 +10,22 @@ export type CreatedLinkView = {
   expiresAt: string | null;
 };
 
+/**
+ * Límites que la página muestra en `maxlength`, `pattern`, `min` y en el
+ * texto de ayuda. Vienen del dominio a través de `http/` para que el HTML no
+ * mantenga una copia propia de las reglas.
+ */
+export type HomeFormLimits = {
+  urlMaxLength: number;
+  aliasMinLength: number;
+  aliasMaxLength: number;
+  aliasPattern: string;
+  expirationMinLabel: string;
+  expirationMaxLabel: string;
+};
+
 export type HomePageInput = PageChrome & {
+  limits: HomeFormLimits;
   created?: CreatedLinkView | null;
   errorMessage?: string | null;
   submittedUrl?: string;
@@ -99,7 +114,10 @@ function renderCreatedCard(created: CreatedLinkView): string {
   `;
 }
 
+const NUMBER_FORMAT = new Intl.NumberFormat('es-ES');
+
 export function renderHomePage({
+  limits,
   created = null,
   errorMessage = null,
   submittedUrl = '',
@@ -108,7 +126,7 @@ export function renderHomePage({
   formToken = '',
   minExpiration = '',
   abuseContactEmail,
-}: HomePageInput = {}): string {
+}: HomePageInput): string {
   const hasCreated = created !== null;
   const formTitle = hasCreated ? 'Acorta otro enlace' : 'Crea tu enlace';
 
@@ -158,7 +176,7 @@ export function renderHomePage({
               autocomplete="off"
               spellcheck="false"
               placeholder="https://ejemplo.com/una/ruta/muy/larga"
-              maxlength="4096"
+              maxlength="${limits.urlMaxLength}"
               required
               value="${escapeHtml(submittedUrl)}"
               ${errorMessage ? 'aria-invalid="true"' : ''}
@@ -176,9 +194,9 @@ export function renderHomePage({
                 autocomplete="off"
                 autocapitalize="none"
                 spellcheck="false"
-                pattern="[A-Za-z0-9_-]{3,32}"
-                minlength="3"
-                maxlength="32"
+                pattern="${escapeHtml(limits.aliasPattern)}"
+                minlength="${limits.aliasMinLength}"
+                maxlength="${limits.aliasMaxLength}"
                 placeholder="mi-enlace"
                 value="${escapeHtml(submittedAlias)}"
               >
@@ -195,9 +213,9 @@ export function renderHomePage({
             </div>
           </div>
           <p class="hint" id="url-hint">
-            Solo http y https · máximo 4.096 caracteres.
-            El alias admite 3–32 letras, números, guion o guion bajo.
-            La caducidad va de 5 minutos a 1 año.
+            Solo http y https · máximo ${NUMBER_FORMAT.format(limits.urlMaxLength)} caracteres.
+            El alias admite ${limits.aliasMinLength}–${limits.aliasMaxLength} letras, números, guion o guion bajo.
+            La caducidad va de ${limits.expirationMinLabel} a ${limits.expirationMaxLabel}.
           </p>
         </form>
         <p class="privacy">

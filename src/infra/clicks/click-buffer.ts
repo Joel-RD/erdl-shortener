@@ -150,7 +150,12 @@ export function createClickBuffer(options: ClickBufferOptions): ClickBuffer {
         timer = null;
       }
 
-      await flush();
+      // El primer flush puede ser uno ya en vuelo (hay que esperarlo aunque el
+      // mapa esté vacío). Los clics que lleguen durante ese `await` caen en el
+      // mapa nuevo, así que se repite hasta drenarlo por completo.
+      do {
+        await flush();
+      } while (pending.size > 0);
     },
 
     get pendingCount() {

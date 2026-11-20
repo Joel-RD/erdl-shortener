@@ -118,10 +118,10 @@ export function validateUrl(raw: string): UrlValidationResult {
 
   if (host === '') return fail('url_invalid');
 
-  if (isLocalHostname(host) || isPrivateAddress(host)) {
-    return fail(
-      isLocalHostname(host) ? 'url_local' : 'url_private_ip',
-    );
+  const localHostname = isLocalHostname(host);
+
+  if (localHostname || isPrivateAddress(host)) {
+    return fail(localHostname ? 'url_local' : 'url_private_ip');
   }
 
   // Un nombre de un solo segmento puede resolverse vía sufijo de búsqueda

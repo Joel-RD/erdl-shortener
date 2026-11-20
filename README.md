@@ -61,7 +61,7 @@ npm start            # node dist/server.js
 npm run db:migrate   # aplica migraciones pendientes (requiere build)
 npm run db:baseline  # registra migraciones cuyo esquema ya existe
 npm run typecheck    # tsc --noEmit
-npm test             # Vitest (191 tests)
+npm test             # Vitest (200 tests)
 npm run test:watch
 ```
 
@@ -76,6 +76,7 @@ src/
 ├── domain/     reglas puras de enlaces y blocklist
 ├── infra/      SQL, caché, buffer de clics y jobs
 ├── security/   HMAC de IP, honeypot y rate limiter
+├── net/        parsers puros de IPv4/IPv6 compartidos
 ├── http/       rutas, middleware y presentadores
 └── ui/         SSR puro (layout y páginas)
 tests/          espejo de src/ (helpers + integración HTTP)

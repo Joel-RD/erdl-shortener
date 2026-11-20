@@ -5,8 +5,9 @@ import type { Client } from '@libsql/client';
 import { logger } from '../../logger.js';
 
 /**
- * `import.meta.url` apunta a `src/db/` en desarrollo y a `dist/db/` tras el
- * build; en ambos casos `../../migrations/` cae en la raíz del proyecto.
+ * `import.meta.url` apunta a `src/infra/db/` en desarrollo y a
+ * `dist/infra/db/` tras el build; en ambos casos `../../../migrations/` cae en
+ * la raíz del proyecto.
  */
 export const DEFAULT_MIGRATIONS_DIR = fileURLToPath(
   new URL('../../../migrations/', import.meta.url),

@@ -1,4 +1,4 @@
-import express, { Router } from 'express';
+import express, { Router, type Response } from 'express';
 import type {
   RateLimiter,
   RateLimitRule,
@@ -11,7 +11,11 @@ import {
   verifyFormToken,
 } from '../../security/form-token.js';
 import { CUSTOM_ALIAS_PATTERN } from '../../domain/links/alias.js';
-import type { CreateLinkInput, LinkService } from '../../domain/links/types.js';
+import type {
+  CreateLinkErrorCode,
+  CreateLinkInput,
+  LinkService,
+} from '../../domain/links/types.js';
 import {
   renderHomePage,
   type CreatedLinkView,
@@ -24,6 +28,7 @@ import {
 } from '../middleware/rate-limits.js';
 import {
   formatDatetimeLocalUtc,
+  getHomeFormLimits,
   parseFormExpiration,
 } from '../presenters/home-form.js';
 import { buildShortUrl } from '../presenters/links.js';
@@ -51,6 +56,25 @@ function firstBodyValue(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
+/**
+ * En el formulario, cualquier error de validación es un 422 (entidad no
+ * procesable); la API distingue 400/409/422 porque un cliente programático
+ * necesita esa diferencia.
+ */
+function formErrorStatus(code: CreateLinkErrorCode): number {
+  if (code === 'alias_taken') return 409;
+  if (code === 'quota_exceeded') return 429;
+  return 422;
+}
+
+type HomePageOverrides = {
+  created?: CreatedLinkView | null;
+  errorMessage?: string | null;
+  submittedUrl?: string;
+  submittedAlias?: string;
+  submittedExpiresAt?: string;
+};
+
 export function createPagesRouter({
   service,
   baseUrl,
@@ -65,6 +89,7 @@ export function createPagesRouter({
   formTokenMinAgeMs = DEFAULT_FORM_MIN_AGE_MS,
 }: PagesRouterOptions): Router {
   const router = Router();
+  const limits = getHomeFormLimits();
 
   function formMeta(ipHash: string): {
     formToken: string;
@@ -80,6 +105,27 @@ export function createPagesRouter({
         new Date(current.getTime() + 6 * 60 * 1000),
       ),
     };
+  }
+
+  /** Único punto que construye respuestas HTML del formulario. */
+  function sendHomePage(
+    res: Response,
+    ipHash: string,
+    status: number,
+    page: HomePageOverrides = {},
+  ): void {
+    res
+      .status(status)
+      .set('Cache-Control', 'no-store')
+      .type('html')
+      .send(
+        renderHomePage({
+          ...page,
+          limits,
+          abuseContactEmail,
+          ...formMeta(ipHash),
+        }),
+      );
   }
 
   router.get('/', async (req, res) => {
@@ -104,18 +150,10 @@ export function createPagesRouter({
 
       if (limited) {
         setRetryAfter(res, limited);
-        res
-          .status(429)
-          .set('Cache-Control', 'no-store')
-          .type('html')
-          .send(
-            renderHomePage({
-              errorMessage:
-                'Demasiadas consultas desde tu conexión. Espera un momento y vuelve a intentarlo.',
-              abuseContactEmail,
-              ...formMeta(ipHash),
-            }),
-          );
+        sendHomePage(res, ipHash, 429, {
+          errorMessage:
+            'Demasiadas consultas desde tu conexión. Espera un momento y vuelve a intentarlo.',
+        });
         return;
       }
 
@@ -133,16 +171,7 @@ export function createPagesRouter({
       }
     }
 
-    res
-      .set('Cache-Control', 'no-store')
-      .type('html')
-      .send(
-        renderHomePage({
-          created,
-          abuseContactEmail,
-          ...formMeta(ipHash),
-        }),
-      );
+    sendHomePage(res, ipHash, 200, { created });
   });
 
   // El parser de formularios se monta SOLO en esta ruta: la API es JSON-only y
@@ -166,42 +195,26 @@ export function createPagesRouter({
       // El campo trampa relleno o un token ausente/manipulado/de otra IP
       // descartan el envío sin crear nada. El mensaje es genérico.
       if (honeypot !== '' || tokenStatus !== 'valid') {
-        res
-          .status(400)
-          .set('Cache-Control', 'no-store')
-          .type('html')
-          .send(
-            renderHomePage({
-              errorMessage:
-                'No se pudo validar el formulario. Recarga la página e inténtalo de nuevo.',
-              submittedUrl,
-              submittedAlias,
-              submittedExpiresAt,
-              abuseContactEmail,
-              ...formMeta(ipHash),
-            }),
-          );
+        sendHomePage(res, ipHash, 400, {
+          errorMessage:
+            'No se pudo validar el formulario. Recarga la página e inténtalo de nuevo.',
+          submittedUrl,
+          submittedAlias,
+          submittedExpiresAt,
+        });
         return;
       }
 
       const expiration = parseFormExpiration(submittedExpiresAt);
 
       if (!expiration.ok) {
-        res
-          .status(422)
-          .set('Cache-Control', 'no-store')
-          .type('html')
-          .send(
-            renderHomePage({
-              errorMessage:
-                'La fecha de caducidad no es válida. Indícala en UTC o déjala vacía.',
-              submittedUrl,
-              submittedAlias,
-              submittedExpiresAt,
-              abuseContactEmail,
-              ...formMeta(ipHash),
-            }),
-          );
+        sendHomePage(res, ipHash, 422, {
+          errorMessage:
+            'La fecha de caducidad no es válida. Indícala en UTC o déjala vacía.',
+          submittedUrl,
+          submittedAlias,
+          submittedExpiresAt,
+        });
         return;
       }
 
@@ -217,21 +230,13 @@ export function createPagesRouter({
 
       if (limited) {
         setRetryAfter(res, limited);
-        res
-          .status(429)
-          .set('Cache-Control', 'no-store')
-          .type('html')
-          .send(
-            renderHomePage({
-              errorMessage:
-                'Demasiadas creaciones desde tu conexión. Espera un momento y vuelve a intentarlo.',
-              submittedUrl,
-              submittedAlias,
-              submittedExpiresAt,
-              abuseContactEmail,
-              ...formMeta(ipHash),
-            }),
-          );
+        sendHomePage(res, ipHash, 429, {
+          errorMessage:
+            'Demasiadas creaciones desde tu conexión. Espera un momento y vuelve a intentarlo.',
+          submittedUrl,
+          submittedAlias,
+          submittedExpiresAt,
+        });
         return;
       }
 
@@ -246,12 +251,7 @@ export function createPagesRouter({
       const result = await service.create(input);
 
       if (!result.ok) {
-        const status =
-          result.code === 'alias_taken'
-            ? 409
-            : result.code === 'quota_exceeded'
-              ? 429
-              : 422;
+        const status = formErrorStatus(result.code);
 
         if (result.code === 'quota_exceeded') {
           setRetryAfter(res, {
@@ -260,20 +260,12 @@ export function createPagesRouter({
           });
         }
 
-        res
-          .status(status)
-          .set('Cache-Control', 'no-store')
-          .type('html')
-          .send(
-            renderHomePage({
-              errorMessage: result.message,
-              submittedUrl,
-              submittedAlias,
-              submittedExpiresAt,
-              abuseContactEmail,
-              ...formMeta(ipHash),
-            }),
-          );
+        sendHomePage(res, ipHash, status, {
+          errorMessage: result.message,
+          submittedUrl,
+          submittedAlias,
+          submittedExpiresAt,
+        });
         return;
       }
 

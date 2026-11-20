@@ -9,7 +9,11 @@ import {
   type CreateLinkInput,
   type LinkService,
 } from '../../domain/links/types.js';
-import { CUSTOM_ALIAS_PATTERN } from '../../domain/links/alias.js';
+import {
+  CUSTOM_ALIAS_PATTERN,
+  MAX_CUSTOM_ALIAS_LENGTH,
+} from '../../domain/links/alias.js';
+import { MAX_URL_LENGTH } from '../../domain/links/validate.js';
 import {
   enforceCreateRateLimits,
   enforceLookupRateLimits,
@@ -17,11 +21,17 @@ import {
   setRetryAfter,
 } from '../middleware/rate-limits.js';
 import { toLinkResponse } from '../presenters/links.js';
+import { getRouteParam } from '../route-params.js';
 
 const createLinkSchema = z
   .object({
-    url: z.string().trim().min(1).max(4096),
-    alias: z.string().trim().min(1).max(32).optional(),
+    url: z.string().trim().min(1).max(MAX_URL_LENGTH),
+    alias: z
+      .string()
+      .trim()
+      .min(1)
+      .max(MAX_CUSTOM_ALIAS_LENGTH)
+      .optional(),
     expiresAt: z
       .union([z.iso.datetime({ offset: true }), z.null()])
       .optional(),
@@ -171,7 +181,7 @@ export function createApiLinksRouter({
       return;
     }
 
-    const alias = req.params.alias ?? '';
+    const alias = getRouteParam(req, 'alias');
 
     // Un alias que no puede existir no merece una consulta a la DB.
     if (!CUSTOM_ALIAS_PATTERN.test(alias)) {

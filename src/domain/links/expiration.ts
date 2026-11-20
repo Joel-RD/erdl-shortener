@@ -1,5 +1,5 @@
-const MIN_EXPIRATION_MS = 5 * 60 * 1000;
-const MAX_EXPIRATION_MS = 365 * 24 * 60 * 60 * 1000;
+export const MIN_EXPIRATION_MS = 5 * 60 * 1000;
+export const MAX_EXPIRATION_MS = 365 * 24 * 60 * 60 * 1000;
 
 export type ExpirationValidation =
   | { ok: true; value: string | null }

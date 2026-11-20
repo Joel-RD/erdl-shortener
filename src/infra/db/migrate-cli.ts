@@ -7,8 +7,8 @@ import { baselineMigrations, runMigrations } from './migrate.js';
  * Utilidades de base de datos para ejecutar fuera del servidor (Render
  * `preDeployCommand`, CI o terminal). Usa el mismo entorno que la app.
  *
- *   node dist/db/migrate-cli.js migrate
- *   node dist/db/migrate-cli.js baseline [--dry-run]
+ *   node dist/infra/db/migrate-cli.js migrate
+ *   node dist/infra/db/migrate-cli.js baseline [--dry-run]
  */
 async function main(): Promise<void> {
   const [command = 'migrate', ...flags] = process.argv.slice(2);

@@ -1,4 +1,4 @@
-import type { Client } from '@libsql/client';
+import type { Client, InStatement } from '@libsql/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createTempDatabase,
@@ -108,5 +108,113 @@ describe('createClickBuffer', () => {
       clicks: 1,
       lastClickedAt: '2026-01-01T00:00:01.000Z',
     });
+  });
+
+  it('close() espera un flush en vuelo aunque no haya clics nuevos', async () => {
+    let releaseBatch!: () => void;
+    let notifyBatchStarted!: () => void;
+
+    const batchStarted = new Promise<void>((resolve) => {
+      notifyBatchStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseBatch = resolve;
+    });
+
+    let finished = false;
+
+    const slowClient = {
+      batch: async () => {
+        notifyBatchStarted();
+        await gate;
+        finished = true;
+        return [];
+      },
+    } as unknown as Client;
+
+    const buffer = createClickBuffer({
+      db: slowClient,
+      intervalMs: 0,
+      maxBatch: 0,
+    });
+
+    buffer.record('buffer-inflight', new Date('2026-01-01T00:00:01.000Z'));
+
+    const firstFlush = buffer.flush();
+    await batchStarted;
+
+    let closeSettled = false;
+    const closing = buffer.close().then(() => {
+      closeSettled = true;
+    });
+
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+
+    releaseBatch();
+    await closing;
+    await firstFlush;
+
+    expect(finished).toBe(true);
+  });
+
+  it('close() no pierde clics llegados durante un flush en vuelo', async () => {
+    let releaseFirstBatch!: () => void;
+    let notifyFirstBatchStarted!: () => void;
+
+    const firstBatchStarted = new Promise<void>((resolve) => {
+      notifyFirstBatchStarted = resolve;
+    });
+    const firstBatchGate = new Promise<void>((resolve) => {
+      releaseFirstBatch = resolve;
+    });
+
+    let totalClicks = 0;
+    let batchCalls = 0;
+
+    const slowClient = {
+      batch: async (statements: readonly InStatement[]) => {
+        batchCalls += 1;
+
+        if (batchCalls === 1) {
+          notifyFirstBatchStarted();
+          await firstBatchGate;
+        }
+
+        for (const statement of statements) {
+          if (typeof statement === 'string') continue;
+
+          const args = statement.args;
+          const clicks = Array.isArray(args) ? args[0] : undefined;
+
+          totalClicks += Number(clicks ?? 0);
+        }
+
+        return [];
+      },
+    } as unknown as Client;
+
+    const buffer = createClickBuffer({
+      db: slowClient,
+      intervalMs: 0,
+      maxBatch: 0,
+    });
+
+    buffer.record('buffer-race', new Date('2026-01-01T00:00:01.000Z'));
+
+    const firstFlush = buffer.flush();
+    await firstBatchStarted;
+
+    // Este clic cae en el mapa nuevo mientras el primer lote sigue en vuelo.
+    buffer.record('buffer-race', new Date('2026-01-01T00:00:02.000Z'));
+
+    const closing = buffer.close();
+    releaseFirstBatch();
+
+    await closing;
+    await firstFlush;
+
+    expect(batchCalls).toBe(2);
+    expect(totalClicks).toBe(2);
   });
 });
