@@ -13,7 +13,8 @@ coverage/
 *.db-shm
 *.db-wal
 
-# Documentación (solo se versiona README y docs/)
+# Documentación (solo se versiona README, CHANGELOG y docs/)
 **/*.md
 !README.md
+!CHANGELOG.md
 !docs/**/*.md

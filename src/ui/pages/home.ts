@@ -221,6 +221,7 @@ export function renderHomePage({
         <p class="privacy">
           No pedimos correo ni contraseña. La IP se usa solo para límites de
           abuso y se guarda como hash temporal.
+          <a href="/privacidad">Cómo tratamos tus datos</a>
         </p>
       </section>
     </main>

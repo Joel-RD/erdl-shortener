@@ -28,6 +28,7 @@ export const RESERVED_ALIASES: ReadonlySet<string> = new Set([
   'favicon.svg',
   'health',
   'links',
+  'privacidad',
   'report',
   'robots.txt',
   'sitemap.xml',

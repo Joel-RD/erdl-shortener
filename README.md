@@ -7,7 +7,11 @@ takedown administrativo, expiración y retención de IPs.
 La guía de construcción por fases está en
 [`docs/plan-MVP-acortador-url.md`](./docs/plan-MVP-acortador-url.md).
 
-## Estado: fases 0–9 completas
+## Estado: alpha v0.1.0-alpha.1 (fases 0–9 completas)
+
+El alcance del MVP está completo. El detalle de esta alpha está en
+[`CHANGELOG.md`](./CHANGELOG.md); el código se distribuye bajo
+[licencia MIT](./LICENSE).
 
 | Fase | Qué aporta |
 | --- | --- |
@@ -61,7 +65,7 @@ npm start            # node dist/server.js
 npm run db:migrate   # aplica migraciones pendientes (requiere build)
 npm run db:baseline  # registra migraciones cuyo esquema ya existe
 npm run typecheck    # tsc --noEmit
-npm test             # Vitest (200 tests)
+npm test             # Vitest (207 tests)
 npm run test:watch
 ```
 
@@ -78,7 +82,7 @@ src/
 ├── security/   HMAC de IP, honeypot y rate limiter
 ├── net/        parsers puros de IPv4/IPv6 compartidos
 ├── http/       rutas, middleware y presentadores
-└── ui/         SSR puro (layout y páginas)
+└── ui/         SSR puro (layout, inicio, error y privacidad)
 tests/          espejo de src/ (helpers + integración HTTP)
 ```
 
@@ -198,6 +202,9 @@ retira con `DELETE /api/v1/links/:alias`.
   retención limitada.
 - **Consecuencia consciente:** esas filas dejan de contar para la cuota y el
   dedupe de esa IP. Es una decisión de privacidad, no un bug.
+- La política pública está en `/privacidad` y se enlaza desde el pie de todas
+  las páginas. Muestra el valor real de `IP_RETENTION_DAYS` y explica qué datos
+  se guardan, para qué sirven y cómo reportar abuso.
 
 ## Límites de abuso
 

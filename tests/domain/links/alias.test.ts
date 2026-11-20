@@ -47,7 +47,7 @@ describe('validateCustomAlias', () => {
     },
   );
 
-  it.each(['api', 'API', 'admin', 'health', 'static', 'styles.css'])(
+  it.each(['api', 'API', 'admin', 'health', 'privacidad', 'static', 'styles.css'])(
     'rechaza el alias reservado %s',
     (alias) => {
       const result = validateCustomAlias(alias);

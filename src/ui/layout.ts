@@ -28,7 +28,10 @@ function renderFooter({ abuseContactEmail }: PageChrome): string {
 
   return `
     <footer class="site-footer">
-      <p>Sin cuentas. Sin cookies de seguimiento. Los enlaces pueden caducar.</p>
+      <p>
+        Sin cuentas. Sin cookies de seguimiento. Los enlaces pueden caducar.
+        <a href="/privacidad">Privacidad</a>
+      </p>
       <p class="abuse">Abuso: ${abuse}</p>
     </footer>
   `;

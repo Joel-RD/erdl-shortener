@@ -204,6 +204,7 @@ export function createApp(options: AppOptions = {}): express.Express {
       createGlobalRules,
       lookupIpRules,
       now,
+      retentionDays: config.retentionDays,
     }),
   );
   app.use(

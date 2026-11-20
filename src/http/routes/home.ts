@@ -20,6 +20,7 @@ import {
   renderHomePage,
   type CreatedLinkView,
 } from '../../ui/pages/home.js';
+import { renderPrivacyPage } from '../../ui/pages/privacy.js';
 import {
   enforceCreateRateLimits,
   enforceLookupRateLimits,
@@ -44,6 +45,8 @@ export type PagesRouterOptions = {
   createGlobalRules: readonly RateLimitRule[];
   lookupIpRules: readonly RateLimitRule[];
   now: () => Date;
+  /** Días de retención del hash de IP que muestra `/privacidad`. */
+  retentionDays: number;
   /** En tests se pone 0 para no esperar; en producción vale 3 s. */
   formTokenMinAgeMs?: number | undefined;
 };
@@ -86,6 +89,7 @@ export function createPagesRouter({
   createGlobalRules,
   lookupIpRules,
   now,
+  retentionDays,
   formTokenMinAgeMs = DEFAULT_FORM_MIN_AGE_MS,
 }: PagesRouterOptions): Router {
   const router = Router();
@@ -127,6 +131,19 @@ export function createPagesRouter({
         }),
       );
   }
+
+  router.get('/privacidad', (_req, res) => {
+    res
+      .status(200)
+      .set('Cache-Control', 'no-store')
+      .type('html')
+      .send(
+        renderPrivacyPage({
+          retentionDays,
+          abuseContactEmail,
+        }),
+      );
+  });
 
   router.get('/', async (req, res) => {
     const requestedAlias = firstQueryValue(req.query.created);

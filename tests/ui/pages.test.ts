@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { getHomeFormLimits } from '../../src/http/presenters/home-form.js';
 import { escapeHtml } from '../../src/ui/escape-html.js';
 import { renderHomePage } from '../../src/ui/pages/home.js';
+import { renderPrivacyPage } from '../../src/ui/pages/privacy.js';
 
 const LIMITS = getHomeFormLimits();
 
@@ -65,5 +66,31 @@ describe('renderHomePage', () => {
     expect(html).toContain('minlength="4"');
     expect(html).toContain('maxlength="12"');
     expect(html).toContain('de 10 minutos a 2 días');
+  });
+});
+
+describe('renderPrivacyPage', () => {
+  it('muestra la retención recibida y escapa el correo de abuso', () => {
+    const html = renderPrivacyPage({
+      retentionDays: 60,
+      abuseContactEmail: 'abuso@example.com"><script>alert(1)</script>',
+    });
+
+    expect(html).toContain('a los 60 días');
+    expect(html).toContain('mailto:abuso@example.com');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+  });
+
+  it('solo carga el script externo y enlaza el inicio y el pie', () => {
+    const html = renderPrivacyPage({ retentionDays: 45 });
+
+    expect(html.match(/<script\b[^>]*>/g)).toEqual([
+      '<script src="/app.js" defer>',
+    ]);
+    expect(html).toContain(
+      '<a class="button button-primary" href="/">Crear un enlace</a>',
+    );
+    expect(html).toContain('<a href="/privacidad">Privacidad</a>');
   });
 });

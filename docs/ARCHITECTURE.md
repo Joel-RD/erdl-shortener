@@ -60,7 +60,8 @@ src/
     ├── layout.ts              # documento, cabecera y pie
     └── pages/
         ├── home.ts
-        └── error.ts
+        ├── error.ts
+        └── privacy.ts         # política pública (/privacidad)
 ```
 
 `migrations/`, `seed/` y `public/` siguen en la raíz porque son recursos del
